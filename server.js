@@ -156,7 +156,7 @@ const soloAdmin = (req, res, next) => {
 // ==========================================
 cron.schedule('*/10 * * * *', async () => {
     try {
-        const cancellati = await pool.query("DELETE FROM prenotazioni WHERE stato = 'cancellato'");
+        const cancellati = await pool.query("DELETE FROM prenotazioni WHERE stato = 'cancellato' AND data < CURRENT_DATE");
         const passati = await pool.query("DELETE FROM prenotazioni WHERE data < CURRENT_DATE AND stato = 'attivo'");
         const totale = (cancellati.rowCount || 0) + (passati.rowCount || 0);
         if (totale > 0) console.log(`Pulizia: eliminati ${totale} appuntamenti`);
@@ -226,8 +226,30 @@ cron.schedule('*/10 * * * *', async () => {
                                 await pool.query('INSERT INTO notifiche (cliente_id, messaggio) VALUES ($1, $2)', [app.cliente_id, messaggio]);
                             }
                         }
+                        // Notifica clienti prima di marcare cancellato
+                        const appAssParams = [b.id];
+                        let appAssQuery = `SELECT p.id, p.cliente_id, p.data, p.ora, bv.nome AS barbiere_nome, sv.nome AS servizio_nome
+                            FROM prenotazioni p
+                            JOIN barbieri bv ON p.barbiere_id = bv.id
+                            JOIN servizi sv ON p.servizio_id = sv.id
+                            WHERE p.barbiere_id = $1 AND p.stato = 'attivo'
+                            AND (p.data > CURRENT_DATE OR (p.data = CURRENT_DATE AND p.ora > CURRENT_TIME))`;
+                        if (info.fine) { appAssQuery += ` AND p.data <= $2`; appAssParams.push(info.fine); }
+                        const appAssRows = await pool.query(appAssQuery, appAssParams);
+                        for (const app of appAssRows.rows) {
+                            if (app.cliente_id) {
+                                const dateObj = new Date(app.data + 'T12:00:00');
+                                const giorni = ['Dom','Lun','Mar','Mer','Gio','Ven','Sab'];
+                                const mesi = ['Gennaio','Febbraio','Marzo','Aprile','Maggio','Giugno','Luglio','Agosto','Settembre','Ottobre','Novembre','Dicembre'];
+                                const dataFmt = `${giorni[dateObj.getDay()]} ${dateObj.getDate()} ${mesi[dateObj.getMonth()]}`;
+                                const msg = `Ci scusiamo per il disagio. Il tuo appuntamento di **${dataFmt}** alle **${app.ora.slice(0,5)}** con **${app.barbiere_nome}** per il servizio di **${app.servizio_nome}** è stato cancellato perché il barbiere non è disponibile.\n\nTi invitiamo a prenotare un nuovo appuntamento.`;
+                                await pool.query('INSERT INTO notifiche (cliente_id, messaggio) VALUES ($1, $2)', [app.cliente_id, msg]);
+                            }
+                        }
+                        // Marca cancellato (non elimina) — così è ripristinabile alla riattivazione
                         const delParams = [b.id];
-                        let delQuery = `DELETE FROM prenotazioni WHERE barbiere_id = $1 AND stato = 'attivo'
+                        let delQuery = `UPDATE prenotazioni SET stato = 'cancellato'
+                            WHERE barbiere_id = $1 AND stato = 'attivo'
                             AND (data > CURRENT_DATE OR (data = CURRENT_DATE AND ora > CURRENT_TIME))`;
                         if (info.fine) { delQuery += ` AND data <= $2`; delParams.push(info.fine); }
                         const eliminati = await pool.query(delQuery, delParams);
@@ -944,9 +966,10 @@ app.post('/api/admin/barbiere-assente', verificaToken, soloAdmin, async (req, re
                 }
             }
 
-            // Elimina appuntamenti
+            // Marca cancellato (non elimina) — così è ripristinabile alla riattivazione
             const delParams = [barbiere_id];
-            let delQuery = `DELETE FROM prenotazioni WHERE barbiere_id = $1 AND stato = 'attivo'
+            let delQuery = `UPDATE prenotazioni SET stato = 'cancellato'
+                 WHERE barbiere_id = $1 AND stato = 'attivo'
                  AND (data > CURRENT_DATE OR (data = CURRENT_DATE AND ora > CURRENT_TIME))`;
             if (fine) { delQuery += ` AND data <= $2`; delParams.push(fine); }
             const eliminati = await pool.query(delQuery, delParams);
@@ -1055,8 +1078,47 @@ app.post('/api/admin/barbiere-presente', verificaToken, soloAdmin, async (req, r
     const { barbiere_id } = req.body;
     if (!barbiere_id) return res.status(400).json({ error: "Manca barbiere_id" });
     try {
+        // Trova appuntamenti cancellati futuri da ripristinare
+        const daRipristinare = await pool.query(
+            `SELECT p.id, p.cliente_id, p.data, p.ora, b.nome AS barbiere_nome, sv.nome AS servizio_nome
+             FROM prenotazioni p
+             JOIN barbieri b ON p.barbiere_id = b.id
+             JOIN servizi sv ON p.servizio_id = sv.id
+             WHERE p.barbiere_id = $1 AND p.stato = 'cancellato'
+             AND (p.data > CURRENT_DATE OR (p.data = CURRENT_DATE AND p.ora >= CURRENT_TIME))`,
+            [barbiere_id]
+        );
+
+        if (daRipristinare.rows.length > 0) {
+            // Ripristina gli appuntamenti a 'attivo'
+            await pool.query(
+                `UPDATE prenotazioni SET stato = 'attivo'
+                 WHERE barbiere_id = $1 AND stato = 'cancellato'
+                 AND (data > CURRENT_DATE OR (data = CURRENT_DATE AND ora >= CURRENT_TIME))`,
+                [barbiere_id]
+            );
+
+            // Notifica ogni cliente del ripristino
+            for (const app of daRipristinare.rows) {
+                if (app.cliente_id) {
+                    const dateObj = new Date(app.data + 'T12:00:00');
+                    const giorniNomi = ['Domenica','Lunedì','Martedì','Mercoledì','Giovedì','Venerdì','Sabato'];
+                    const mesi = ['Gennaio','Febbraio','Marzo','Aprile','Maggio','Giugno','Luglio','Agosto','Settembre','Ottobre','Novembre','Dicembre'];
+                    const dataFormattata = `${giorniNomi[dateObj.getDay()]} ${dateObj.getDate()} ${mesi[dateObj.getMonth()]}`;
+                    const messaggio = `Buone notizie! Il tuo appuntamento di **${dataFormattata}** alle **${app.ora.slice(0,5)}** con **${app.barbiere_nome}** per il servizio di **${app.servizio_nome}** è stato ripristinato. Il barbiere è nuovamente disponibile.\n\nTi aspettiamo!`;
+                    await pool.query('INSERT INTO notifiche (cliente_id, messaggio) VALUES ($1, $2)', [app.cliente_id, messaggio]);
+                }
+            }
+        }
+
+        // Riattiva il barbiere
         await pool.query('UPDATE barbieri SET assente = false, motivo_assenza = NULL WHERE id = $1', [barbiere_id]);
-        res.json({ success: true, messaggio: "Barbiere riattivato" });
+
+        res.json({
+            success: true,
+            messaggio: `Barbiere riattivato. ${daRipristinare.rows.length} appuntamenti ripristinati.`,
+            ripristinati: daRipristinare.rows.length
+        });
     } catch (err) {
         res.status(500).json({ error: "Errore" });
     }
