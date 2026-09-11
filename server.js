@@ -681,6 +681,10 @@ app.get('/api/prenotazioni/miei', verificaToken, async (req, res) => {
     const cliente_uuid = req.utente.uuid;
 
     try {
+        const italianNow = new Date().toLocaleString('sv-SE', { timeZone: 'Europe/Rome' }).replace(' ', 'T');
+        const oggi = italianNow.slice(0, 10);
+        const italianTime = italianNow.slice(11, 16);
+
         let query = `
             SELECT p.id, p.data, p.ora, p.stato, p.sede_id,
                     s.nome AS sede_nome, b.nome AS barbiere_nome,
@@ -689,11 +693,11 @@ app.get('/api/prenotazioni/miei', verificaToken, async (req, res) => {
              JOIN sedi s ON p.sede_id = s.id
              JOIN barbieri b ON p.barbiere_id = b.id
              JOIN servizi sv ON p.servizio_id = sv.id
-             WHERE p.cliente_uuid = $1 AND p.stato = 'attivo'
-             AND (p.data > CURRENT_DATE OR (p.data = CURRENT_DATE AND p.ora >= CURRENT_TIME))`;
-        const params = [cliente_uuid];
+             WHERE p.cliente_uuid = $1 AND p.stato IN ('attivo', 'cancellato')
+             AND (p.data > $2::date OR (p.data = $2::date AND p.ora >= $3::time))`;
+        const params = [cliente_uuid, oggi, italianTime];
 
-        if (sede_id) { query += ` AND p.sede_id = $2`; params.push(sede_id); }
+        if (sede_id) { query += ` AND p.sede_id = $4`; params.push(sede_id); }
         query += ` ORDER BY p.data ASC, p.ora ASC`;
 
         const result = await pool.query(query, params);
