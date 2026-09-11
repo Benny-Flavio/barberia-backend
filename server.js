@@ -721,23 +721,21 @@ app.delete('/api/prenotazioni/:id', verificaToken, async (req, res) => {
     }
 });
 
-// DEBUG: verifica schema tabella notifiche (rimuovere dopo debug)
-app.get('/api/debug/schema', verificaToken, soloAdmin, async (req, res) => {
+// DEBUG PUBBLICO (rimuovere dopo debug)
+app.get('/api/debug/info', async (req, res) => {
     try {
-        const cols = await pool.query(`SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'notifiche' ORDER BY ordinal_position`);
-        const count = await pool.query(`SELECT COUNT(*) FROM notifiche`);
-        const last = await pool.query(`SELECT * FROM notifiche ORDER BY created_at DESC LIMIT 3`);
-        res.json({ columns: cols.rows, total: count.rows[0].count, last3: last.rows });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// DEBUG: verifica appuntamenti con cliente_uuid
-app.get('/api/debug/prenotazioni', verificaToken, soloAdmin, async (req, res) => {
-    try {
-        const result = await pool.query(`SELECT id, barbiere_id, data, ora, stato, cliente_uuid, cliente_nome FROM prenotazioni ORDER BY data DESC, ora DESC LIMIT 10`);
-        res.json(result.rows);
+        const notifCols = await pool.query(`SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'notifiche' ORDER BY ordinal_position`);
+        const prenCols = await pool.query(`SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'prenotazioni' ORDER BY ordinal_position`);
+        const notifCount = await pool.query(`SELECT COUNT(*) FROM notifiche`);
+        const lastNotif = await pool.query(`SELECT id, cliente_uuid, LEFT(messaggio,60) AS msg, created_at FROM notifiche ORDER BY created_at DESC LIMIT 5`);
+        const lastPren = await pool.query(`SELECT id, data, ora, stato, cliente_uuid, cliente_nome FROM prenotazioni ORDER BY data DESC, ora DESC LIMIT 8`);
+        res.json({
+            notifiche_colonne: notifCols.rows,
+            prenotazioni_colonne: prenCols.rows,
+            notifiche_totali: notifCount.rows[0].count,
+            ultime_notifiche: lastNotif.rows,
+            ultime_prenotazioni: lastPren.rows
+        });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
