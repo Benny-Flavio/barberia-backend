@@ -984,7 +984,7 @@ app.post('/api/admin/barbiere-assente', verificaToken, soloAdmin, async (req, re
             for (const app of appuntamenti.rows) {
                 if (app.cliente_uuid) {
                     const dateObj = new Date(app.data);
-                    const giorniNomi = ['Dom','Lun','Mar','Mer','Gio','Ven','Sab'];
+                    const giorniNomi = ['Domenica','Lunedì','Martedì','Mercoledì','Giovedì','Venerdì','Sabato'];
                     const mesi = ['Gennaio','Febbraio','Marzo','Aprile','Maggio','Giugno','Luglio','Agosto','Settembre','Ottobre','Novembre','Dicembre'];
                     const dataFormattata = `${giorniNomi[dateObj.getDay()]} ${dateObj.getDate()} ${mesi[dateObj.getMonth()]}`;
                     const messaggio = `Ci scusiamo per il disagio. Il tuo appuntamento di **${dataFormattata}** alle **${app.ora.slice(0,5)}** con **${app.barbiere_nome}** per il servizio di **${app.servizio_nome}** è stato cancellato perché il barbiere non è disponibile.\n\nTi invitiamo a prenotare un nuovo appuntamento.`;
