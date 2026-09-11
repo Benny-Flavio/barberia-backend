@@ -914,7 +914,10 @@ app.post('/api/admin/barbiere-assente', verificaToken, soloAdmin, async (req, re
     if (!barbiere_id) return res.status(400).json({ error: "Manca barbiere_id" });
 
     try {
-        const oggi = new Date().toISOString().split('T')[0];
+        // Usa ora italiana — CURRENT_DATE/CURRENT_TIME sul server UTC darebbe orari sbagliati
+        const italianNow = new Date().toLocaleString('sv-SE', { timeZone: 'Europe/Rome' }).replace(' ', 'T');
+        const oggi = italianNow.slice(0, 10);
+        const italianTime = italianNow.slice(11, 16);
         const inizio = data_inizio || oggi;
 
         // Calcola data fine (se specificati i giorni)
@@ -941,22 +944,22 @@ app.post('/api/admin/barbiere-assente', verificaToken, soloAdmin, async (req, re
                 [JSON.stringify(infoObj), barbiere_id]
             );
 
-            // Trova appuntamenti da cancellare nel periodo
-            const appParams = [barbiere_id];
+            // Trova appuntamenti da cancellare nel periodo (usa data/ora italiana come parametri)
+            const appParams = [barbiere_id, oggi, italianTime];
             let appQuery = `SELECT p.id, p.cliente_uuid, p.data, p.ora, b.nome AS barbiere_nome, sv.nome AS servizio_nome
                  FROM prenotazioni p
                  JOIN barbieri b ON p.barbiere_id = b.id
                  JOIN servizi sv ON p.servizio_id = sv.id
                  WHERE p.barbiere_id = $1 AND p.stato = 'attivo'
-                 AND (p.data > CURRENT_DATE OR (p.data = CURRENT_DATE AND p.ora > CURRENT_TIME))`;
-            if (fine) { appQuery += ` AND p.data <= $2`; appParams.push(fine); }
+                 AND (p.data > $2::date OR (p.data = $2::date AND p.ora >= $3::time))`;
+            if (fine) { appQuery += ` AND p.data <= $4::date`; appParams.push(fine); }
             const appuntamenti = await pool.query(appQuery, appParams);
 
             // Notifica clienti registrati
             let notificheInviate = 0;
             for (const app of appuntamenti.rows) {
                 if (app.cliente_uuid) {
-                    const dateObj = new Date(app.data);
+                    const dateObj = new Date(app.data + 'T12:00:00');
                     const giorniNomi = ['Dom','Lun','Mar','Mer','Gio','Ven','Sab'];
                     const mesi = ['Gennaio','Febbraio','Marzo','Aprile','Maggio','Giugno','Luglio','Agosto','Settembre','Ottobre','Novembre','Dicembre'];
                     const dataFormattata = `${giorniNomi[dateObj.getDay()]} ${dateObj.getDate()} ${mesi[dateObj.getMonth()]}`;
@@ -967,11 +970,11 @@ app.post('/api/admin/barbiere-assente', verificaToken, soloAdmin, async (req, re
             }
 
             // Marca cancellato (non elimina) — così è ripristinabile alla riattivazione
-            const delParams = [barbiere_id];
+            const delParams = [barbiere_id, oggi, italianTime];
             let delQuery = `UPDATE prenotazioni SET stato = 'cancellato'
                  WHERE barbiere_id = $1 AND stato = 'attivo'
-                 AND (data > CURRENT_DATE OR (data = CURRENT_DATE AND ora > CURRENT_TIME))`;
-            if (fine) { delQuery += ` AND data <= $2`; delParams.push(fine); }
+                 AND (data > $2::date OR (data = $2::date AND ora >= $3::time))`;
+            if (fine) { delQuery += ` AND data <= $4::date`; delParams.push(fine); }
             const eliminati = await pool.query(delQuery, delParams);
 
             res.json({
@@ -1078,15 +1081,19 @@ app.post('/api/admin/barbiere-presente', verificaToken, soloAdmin, async (req, r
     const { barbiere_id } = req.body;
     if (!barbiere_id) return res.status(400).json({ error: "Manca barbiere_id" });
     try {
-        // Trova appuntamenti cancellati futuri da ripristinare
+        const italianNow = new Date().toLocaleString('sv-SE', { timeZone: 'Europe/Rome' }).replace(' ', 'T');
+        const italianDate = italianNow.slice(0, 10);
+        const italianTime = italianNow.slice(11, 16);
+
+        // Trova appuntamenti cancellati futuri da ripristinare (usa ora italiana)
         const daRipristinare = await pool.query(
             `SELECT p.id, p.cliente_uuid, p.data, p.ora, b.nome AS barbiere_nome, sv.nome AS servizio_nome
              FROM prenotazioni p
              JOIN barbieri b ON p.barbiere_id = b.id
              JOIN servizi sv ON p.servizio_id = sv.id
              WHERE p.barbiere_id = $1 AND p.stato = 'cancellato'
-             AND (p.data > CURRENT_DATE OR (p.data = CURRENT_DATE AND p.ora >= CURRENT_TIME))`,
-            [barbiere_id]
+             AND (p.data > $2::date OR (p.data = $2::date AND p.ora >= $3::time))`,
+            [barbiere_id, italianDate, italianTime]
         );
 
         if (daRipristinare.rows.length > 0) {
@@ -1094,8 +1101,8 @@ app.post('/api/admin/barbiere-presente', verificaToken, soloAdmin, async (req, r
             await pool.query(
                 `UPDATE prenotazioni SET stato = 'attivo'
                  WHERE barbiere_id = $1 AND stato = 'cancellato'
-                 AND (data > CURRENT_DATE OR (data = CURRENT_DATE AND ora >= CURRENT_TIME))`,
-                [barbiere_id]
+                 AND (data > $2::date OR (data = $2::date AND ora >= $3::time))`,
+                [barbiere_id, italianDate, italianTime]
             );
 
             // Notifica ogni cliente del ripristino
