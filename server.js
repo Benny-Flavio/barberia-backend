@@ -208,7 +208,7 @@ cron.schedule('*/10 * * * *', async () => {
                         [JSON.stringify(info), b.id]);
                     if (info.tipo === 'assente') {
                         const params = [b.id];
-                        let cancelQuery = `SELECT p.id, p.cliente_id, p.data, p.ora, bv.nome AS barbiere_nome, sv.nome AS servizio_nome
+                        let cancelQuery = `SELECT p.id, p.cliente_uuid, p.data, p.ora, bv.nome AS barbiere_nome, sv.nome AS servizio_nome
                             FROM prenotazioni p
                             JOIN barbieri bv ON p.barbiere_id = bv.id
                             JOIN servizi sv ON p.servizio_id = sv.id
@@ -217,18 +217,18 @@ cron.schedule('*/10 * * * *', async () => {
                         if (info.fine) { cancelQuery += ` AND p.data <= $2`; params.push(info.fine); }
                         const apps = await pool.query(cancelQuery, params);
                         for (const app of apps.rows) {
-                            if (app.cliente_id) {
+                            if (app.cliente_uuid) {
                                 const dateObj = new Date(app.data);
                                 const giorni = ['Dom','Lun','Mar','Mer','Gio','Ven','Sab'];
                                 const mesi = ['Gennaio','Febbraio','Marzo','Aprile','Maggio','Giugno','Luglio','Agosto','Settembre','Ottobre','Novembre','Dicembre'];
                                 const dataFmt = `${giorni[dateObj.getDay()]} ${dateObj.getDate()} ${mesi[dateObj.getMonth()]}`;
                                 const messaggio = `Ci scusiamo per il disagio. Il tuo appuntamento di **${dataFmt}** alle **${app.ora.slice(0,5)}** con **${app.barbiere_nome}** per il servizio di **${app.servizio_nome}** è stato cancellato perché il barbiere non è disponibile.\n\nTi invitiamo a prenotare un nuovo appuntamento.`;
-                                await pool.query('INSERT INTO notifiche (cliente_id, messaggio) VALUES ($1, $2)', [app.cliente_id, messaggio]);
+                                await pool.query('INSERT INTO notifiche (cliente_uuid, messaggio) VALUES ($1, $2)', [app.cliente_uuid, messaggio]);
                             }
                         }
                         // Notifica clienti prima di marcare cancellato
                         const appAssParams = [b.id];
-                        let appAssQuery = `SELECT p.id, p.cliente_id, p.data, p.ora, bv.nome AS barbiere_nome, sv.nome AS servizio_nome
+                        let appAssQuery = `SELECT p.id, p.cliente_uuid, p.data, p.ora, bv.nome AS barbiere_nome, sv.nome AS servizio_nome
                             FROM prenotazioni p
                             JOIN barbieri bv ON p.barbiere_id = bv.id
                             JOIN servizi sv ON p.servizio_id = sv.id
@@ -237,13 +237,13 @@ cron.schedule('*/10 * * * *', async () => {
                         if (info.fine) { appAssQuery += ` AND p.data <= $2`; appAssParams.push(info.fine); }
                         const appAssRows = await pool.query(appAssQuery, appAssParams);
                         for (const app of appAssRows.rows) {
-                            if (app.cliente_id) {
+                            if (app.cliente_uuid) {
                                 const dateObj = new Date(app.data + 'T12:00:00');
                                 const giorni = ['Dom','Lun','Mar','Mer','Gio','Ven','Sab'];
                                 const mesi = ['Gennaio','Febbraio','Marzo','Aprile','Maggio','Giugno','Luglio','Agosto','Settembre','Ottobre','Novembre','Dicembre'];
                                 const dataFmt = `${giorni[dateObj.getDay()]} ${dateObj.getDate()} ${mesi[dateObj.getMonth()]}`;
                                 const msg = `Ci scusiamo per il disagio. Il tuo appuntamento di **${dataFmt}** alle **${app.ora.slice(0,5)}** con **${app.barbiere_nome}** per il servizio di **${app.servizio_nome}** è stato cancellato perché il barbiere non è disponibile.\n\nTi invitiamo a prenotare un nuovo appuntamento.`;
-                                await pool.query('INSERT INTO notifiche (cliente_id, messaggio) VALUES ($1, $2)', [app.cliente_id, msg]);
+                                await pool.query('INSERT INTO notifiche (cliente_uuid, messaggio) VALUES ($1, $2)', [app.cliente_uuid, msg]);
                             }
                         }
                         // Marca cancellato (non elimina) — così è ripristinabile alla riattivazione
@@ -260,7 +260,7 @@ cron.schedule('*/10 * * * *', async () => {
                         const oraFineP = info.fine.slice(11, 16);
                         const dataP = info.inizio.slice(0, 10);
                         const appsP = await pool.query(
-                            `SELECT p.id, p.cliente_id, p.data, p.ora, bv.nome AS barbiere_nome, sv.nome AS servizio_nome
+                            `SELECT p.id, p.cliente_uuid, p.data, p.ora, bv.nome AS barbiere_nome, sv.nome AS servizio_nome
                              FROM prenotazioni p
                              JOIN barbieri bv ON p.barbiere_id = bv.id
                              JOIN servizi sv ON p.servizio_id = sv.id
@@ -269,13 +269,13 @@ cron.schedule('*/10 * * * *', async () => {
                             [b.id, dataP, oraInizioP, oraFineP]
                         );
                         for (const app of appsP.rows) {
-                            if (app.cliente_id) {
+                            if (app.cliente_uuid) {
                                 const dateObj = new Date(app.data + 'T12:00:00');
                                 const giorni = ['Dom','Lun','Mar','Mer','Gio','Ven','Sab'];
                                 const mesi = ['Gennaio','Febbraio','Marzo','Aprile','Maggio','Giugno','Luglio','Agosto','Settembre','Ottobre','Novembre','Dicembre'];
                                 const dataFmt = `${giorni[dateObj.getDay()]} ${dateObj.getDate()} ${mesi[dateObj.getMonth()]}`;
                                 const msg = `Ci scusiamo per il disagio. Il tuo appuntamento di **${dataFmt}** alle **${app.ora.slice(0,5)}** con **${app.barbiere_nome}** per il servizio di **${app.servizio_nome}** è stato cancellato perché il barbiere è in permesso.\n\nTi invitiamo a prenotare un nuovo appuntamento.`;
-                                await pool.query('INSERT INTO notifiche (cliente_id, messaggio) VALUES ($1, $2)', [app.cliente_id, msg]);
+                                await pool.query('INSERT INTO notifiche (cliente_uuid, messaggio) VALUES ($1, $2)', [app.cliente_uuid, msg]);
                             }
                         }
                         await pool.query(
@@ -943,7 +943,7 @@ app.post('/api/admin/barbiere-assente', verificaToken, soloAdmin, async (req, re
 
             // Trova appuntamenti da cancellare nel periodo
             const appParams = [barbiere_id];
-            let appQuery = `SELECT p.id, p.cliente_id, p.data, p.ora, b.nome AS barbiere_nome, sv.nome AS servizio_nome
+            let appQuery = `SELECT p.id, p.cliente_uuid, p.data, p.ora, b.nome AS barbiere_nome, sv.nome AS servizio_nome
                  FROM prenotazioni p
                  JOIN barbieri b ON p.barbiere_id = b.id
                  JOIN servizi sv ON p.servizio_id = sv.id
@@ -955,13 +955,13 @@ app.post('/api/admin/barbiere-assente', verificaToken, soloAdmin, async (req, re
             // Notifica clienti registrati
             let notificheInviate = 0;
             for (const app of appuntamenti.rows) {
-                if (app.cliente_id) {
+                if (app.cliente_uuid) {
                     const dateObj = new Date(app.data);
                     const giorniNomi = ['Dom','Lun','Mar','Mer','Gio','Ven','Sab'];
                     const mesi = ['Gennaio','Febbraio','Marzo','Aprile','Maggio','Giugno','Luglio','Agosto','Settembre','Ottobre','Novembre','Dicembre'];
                     const dataFormattata = `${giorniNomi[dateObj.getDay()]} ${dateObj.getDate()} ${mesi[dateObj.getMonth()]}`;
                     const messaggio = `Ci scusiamo per il disagio. Il tuo appuntamento di **${dataFormattata}** alle **${app.ora.slice(0,5)}** con **${app.barbiere_nome}** per il servizio di **${app.servizio_nome}** è stato cancellato perché il barbiere non è disponibile.\n\nTi invitiamo a prenotare un nuovo appuntamento.`;
-                    await pool.query('INSERT INTO notifiche (cliente_id, messaggio) VALUES ($1, $2)', [app.cliente_id, messaggio]);
+                    await pool.query('INSERT INTO notifiche (cliente_uuid, messaggio) VALUES ($1, $2)', [app.cliente_uuid, messaggio]);
                     notificheInviate++;
                 }
             }
@@ -1031,7 +1031,7 @@ app.post('/api/admin/barbiere-permesso', verificaToken, soloAdmin, async (req, r
 
         // Cerca appuntamenti da cancellare per inviare notifiche prima di aggiornare
         const appsPermesso = await pool.query(
-            `SELECT p.id, p.cliente_id, p.data, p.ora, bv.nome AS barbiere_nome, sv.nome AS servizio_nome
+            `SELECT p.id, p.cliente_uuid, p.data, p.ora, bv.nome AS barbiere_nome, sv.nome AS servizio_nome
              FROM prenotazioni p
              JOIN barbieri bv ON p.barbiere_id = bv.id
              JOIN servizi sv ON p.servizio_id = sv.id
@@ -1041,13 +1041,13 @@ app.post('/api/admin/barbiere-permesso', verificaToken, soloAdmin, async (req, r
         );
 
         for (const app of appsPermesso.rows) {
-            if (app.cliente_id) {
+            if (app.cliente_uuid) {
                 const dateObj = new Date(app.data + 'T12:00:00');
                 const giorniNomi = ['Domenica','Lunedì','Martedì','Mercoledì','Giovedì','Venerdì','Sabato'];
                 const mesi = ['Gennaio','Febbraio','Marzo','Aprile','Maggio','Giugno','Luglio','Agosto','Settembre','Ottobre','Novembre','Dicembre'];
                 const dataFormattata = `${giorniNomi[dateObj.getDay()]} ${dateObj.getDate()} ${mesi[dateObj.getMonth()]}`;
                 const messaggio = `Ci scusiamo per il disagio. Il tuo appuntamento di **${dataFormattata}** alle **${app.ora.slice(0,5)}** con **${app.barbiere_nome}** per il servizio di **${app.servizio_nome}** è stato cancellato perché il barbiere è in permesso.\n\nTi invitiamo a prenotare un nuovo appuntamento.`;
-                await pool.query('INSERT INTO notifiche (cliente_id, messaggio) VALUES ($1, $2)', [app.cliente_id, messaggio]);
+                await pool.query('INSERT INTO notifiche (cliente_uuid, messaggio) VALUES ($1, $2)', [app.cliente_uuid, messaggio]);
             }
         }
 
@@ -1080,7 +1080,7 @@ app.post('/api/admin/barbiere-presente', verificaToken, soloAdmin, async (req, r
     try {
         // Trova appuntamenti cancellati futuri da ripristinare
         const daRipristinare = await pool.query(
-            `SELECT p.id, p.cliente_id, p.data, p.ora, b.nome AS barbiere_nome, sv.nome AS servizio_nome
+            `SELECT p.id, p.cliente_uuid, p.data, p.ora, b.nome AS barbiere_nome, sv.nome AS servizio_nome
              FROM prenotazioni p
              JOIN barbieri b ON p.barbiere_id = b.id
              JOIN servizi sv ON p.servizio_id = sv.id
@@ -1100,13 +1100,13 @@ app.post('/api/admin/barbiere-presente', verificaToken, soloAdmin, async (req, r
 
             // Notifica ogni cliente del ripristino
             for (const app of daRipristinare.rows) {
-                if (app.cliente_id) {
+                if (app.cliente_uuid) {
                     const dateObj = new Date(app.data + 'T12:00:00');
                     const giorniNomi = ['Domenica','Lunedì','Martedì','Mercoledì','Giovedì','Venerdì','Sabato'];
                     const mesi = ['Gennaio','Febbraio','Marzo','Aprile','Maggio','Giugno','Luglio','Agosto','Settembre','Ottobre','Novembre','Dicembre'];
                     const dataFormattata = `${giorniNomi[dateObj.getDay()]} ${dateObj.getDate()} ${mesi[dateObj.getMonth()]}`;
                     const messaggio = `Buone notizie! Il tuo appuntamento di **${dataFormattata}** alle **${app.ora.slice(0,5)}** con **${app.barbiere_nome}** per il servizio di **${app.servizio_nome}** è stato ripristinato. Il barbiere è nuovamente disponibile.\n\nTi aspettiamo!`;
-                    await pool.query('INSERT INTO notifiche (cliente_id, messaggio) VALUES ($1, $2)', [app.cliente_id, messaggio]);
+                    await pool.query('INSERT INTO notifiche (cliente_uuid, messaggio) VALUES ($1, $2)', [app.cliente_uuid, messaggio]);
                 }
             }
         }
