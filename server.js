@@ -721,6 +721,28 @@ app.delete('/api/prenotazioni/:id', verificaToken, async (req, res) => {
     }
 });
 
+// DEBUG: verifica schema tabella notifiche (rimuovere dopo debug)
+app.get('/api/debug/schema', verificaToken, soloAdmin, async (req, res) => {
+    try {
+        const cols = await pool.query(`SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'notifiche' ORDER BY ordinal_position`);
+        const count = await pool.query(`SELECT COUNT(*) FROM notifiche`);
+        const last = await pool.query(`SELECT * FROM notifiche ORDER BY created_at DESC LIMIT 3`);
+        res.json({ columns: cols.rows, total: count.rows[0].count, last3: last.rows });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// DEBUG: verifica appuntamenti con cliente_uuid
+app.get('/api/debug/prenotazioni', verificaToken, soloAdmin, async (req, res) => {
+    try {
+        const result = await pool.query(`SELECT id, barbiere_id, data, ora, stato, cliente_uuid, cliente_nome FROM prenotazioni ORDER BY data DESC, ora DESC LIMIT 10`);
+        res.json(result.rows);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // Notifiche cliente
 app.get('/api/notifiche', verificaToken, async (req, res) => {
     try {
@@ -997,8 +1019,8 @@ app.post('/api/admin/barbiere-assente', verificaToken, soloAdmin, async (req, re
             res.json({ success: true, messaggio: `Assenza programmata per il ${dataFmt}.` });
         }
     } catch (err) {
-        console.error("Errore assenza:", err);
-        res.status(500).json({ error: "Errore nella gestione dell'assenza" });
+        console.error("Errore assenza:", err.message, err.stack);
+        res.status(500).json({ error: "Errore nella gestione dell'assenza: " + err.message });
     }
 });
 
@@ -1076,7 +1098,8 @@ app.post('/api/admin/barbiere-permesso', verificaToken, soloAdmin, async (req, r
             res.json({ success: true, messaggio: `Permesso programmato per il ${dataFmt} alle ${oraI} (${durata})` });
         }
     } catch (err) {
-        res.status(500).json({ error: "Errore nella gestione del permesso" });
+        console.error("Errore permesso:", err.message, err.stack);
+        res.status(500).json({ error: "Errore nella gestione del permesso: " + err.message });
     }
 });
 
