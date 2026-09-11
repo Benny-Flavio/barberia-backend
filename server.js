@@ -238,7 +238,7 @@ cron.schedule('*/10 * * * *', async () => {
                         const appAssRows = await pool.query(appAssQuery, appAssParams);
                         for (const app of appAssRows.rows) {
                             if (app.cliente_uuid) {
-                                const dateObj = new Date(app.data + 'T12:00:00');
+                                const dateObj = new Date(app.data);
                                 const giorni = ['Dom','Lun','Mar','Mer','Gio','Ven','Sab'];
                                 const mesi = ['Gennaio','Febbraio','Marzo','Aprile','Maggio','Giugno','Luglio','Agosto','Settembre','Ottobre','Novembre','Dicembre'];
                                 const dataFmt = `${giorni[dateObj.getDay()]} ${dateObj.getDate()} ${mesi[dateObj.getMonth()]}`;
@@ -270,7 +270,7 @@ cron.schedule('*/10 * * * *', async () => {
                         );
                         for (const app of appsP.rows) {
                             if (app.cliente_uuid) {
-                                const dateObj = new Date(app.data + 'T12:00:00');
+                                const dateObj = new Date(app.data);
                                 const giorni = ['Dom','Lun','Mar','Mer','Gio','Ven','Sab'];
                                 const mesi = ['Gennaio','Febbraio','Marzo','Aprile','Maggio','Giugno','Luglio','Agosto','Settembre','Ottobre','Novembre','Dicembre'];
                                 const dataFmt = `${giorni[dateObj.getDay()]} ${dateObj.getDate()} ${mesi[dateObj.getMonth()]}`;
@@ -983,7 +983,7 @@ app.post('/api/admin/barbiere-assente', verificaToken, soloAdmin, async (req, re
             let notificheInviate = 0;
             for (const app of appuntamenti.rows) {
                 if (app.cliente_uuid) {
-                    const dateObj = new Date(app.data + 'T12:00:00');
+                    const dateObj = new Date(app.data);
                     const giorniNomi = ['Dom','Lun','Mar','Mer','Gio','Ven','Sab'];
                     const mesi = ['Gennaio','Febbraio','Marzo','Aprile','Maggio','Giugno','Luglio','Agosto','Settembre','Ottobre','Novembre','Dicembre'];
                     const dataFormattata = `${giorniNomi[dateObj.getDay()]} ${dateObj.getDate()} ${mesi[dateObj.getMonth()]}`;
@@ -1069,7 +1069,7 @@ app.post('/api/admin/barbiere-permesso', verificaToken, soloAdmin, async (req, r
 
         for (const app of appsPermesso.rows) {
             if (app.cliente_uuid) {
-                const dateObj = new Date(app.data + 'T12:00:00');
+                const dateObj = new Date(app.data);
                 const giorniNomi = ['Domenica','Lunedì','Martedì','Mercoledì','Giovedì','Venerdì','Sabato'];
                 const mesi = ['Gennaio','Febbraio','Marzo','Aprile','Maggio','Giugno','Luglio','Agosto','Settembre','Ottobre','Novembre','Dicembre'];
                 const dataFormattata = `${giorniNomi[dateObj.getDay()]} ${dateObj.getDate()} ${mesi[dateObj.getMonth()]}`;
@@ -1133,7 +1133,7 @@ app.post('/api/admin/barbiere-presente', verificaToken, soloAdmin, async (req, r
             // Notifica ogni cliente del ripristino
             for (const app of daRipristinare.rows) {
                 if (app.cliente_uuid) {
-                    const dateObj = new Date(app.data + 'T12:00:00');
+                    const dateObj = new Date(app.data);
                     const giorniNomi = ['Domenica','Lunedì','Martedì','Mercoledì','Giovedì','Venerdì','Sabato'];
                     const mesi = ['Gennaio','Febbraio','Marzo','Aprile','Maggio','Giugno','Luglio','Agosto','Settembre','Ottobre','Novembre','Dicembre'];
                     const dataFormattata = `${giorniNomi[dateObj.getDay()]} ${dateObj.getDate()} ${mesi[dateObj.getMonth()]}`;
