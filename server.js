@@ -3,7 +3,6 @@ const cors = require('cors');
 const { Pool } = require('pg');
 require('dotenv').config();
 const cron = require('node-cron');
-const bcrypt = require('bcrypt');
 const rateLimit = require('express-rate-limit');
 
 const app = express();
@@ -86,6 +85,7 @@ const verificaToken = async (req, res, next) => {
         const token = authHeader.split(' ')[1];
 
         // Controlla cache prima di chiamare Supabase
+        req.token = token;
         const cached = tokenCache.get(token);
         if (cached && cached.scadenza > Date.now()) {
             req.utente = cached.utente;
@@ -138,11 +138,14 @@ const verificaToken = async (req, res, next) => {
         const utente = {
             id: uuid,
             uuid,
+            email: userData.email,
             barbiere_id: u.barbiere_id,
             nome,
             cognome,
             telefono,
             ruolo: u.ruolo,
+            // admin = barbiere: vede solo la propria agenda; super_admin = titolare: vede tutto
+            agenda_personale: u.ruolo === 'admin',
         };
 
         // Salva in cache per 5 minuti (il token Supabase dura 1 ora, quindi è sicuro)
@@ -159,8 +162,21 @@ const soloAdmin = (req, res, next) => {
     if (req.utente.ruolo !== 'admin' && req.utente.ruolo !== 'super_admin') {
         return res.status(403).json({ error: "Accesso riservato ai barbieri" });
     }
+    if (req.utente.agenda_personale && !req.utente.barbiere_id) {
+        return res.status(403).json({ error: "Account non collegato a nessun barbiere" });
+    }
     next();
 };
+
+// Barbiere a cui è limitato l'utente staff (null = nessun limite, titolare)
+const barbiereScope = (utente) => utente.agenda_personale ? utente.barbiere_id : null;
+
+const puoGestireBarbiere = (utente, barbiereId) => {
+    const scope = barbiereScope(utente);
+    return scope === null || Number(barbiereId) === scope;
+};
+
+const vietato = (res) => res.status(403).json({ error: "Puoi gestire solo la tua agenda" });
 
 // ==========================================
 // CRON JOB - Pulizia ogni 10 minuti
@@ -312,10 +328,11 @@ cron.schedule('*/10 * * * *', async () => {
 // Verifica token (per auto-login)
 app.get('/api/auth/me', verificaToken, async (req, res) => {
     try {
-        if (req.utente.ruolo === 'barbiere') {
+        // Barbiere con agenda personale: solo le sedi in cui lavora
+        if (req.utente.agenda_personale && req.utente.barbiere_id) {
             const sedi = await pool.query(
                 `SELECT DISTINCT s.id, s.nome FROM sedi s JOIN turni_rotazione t ON s.id = t.sede_id WHERE t.barbiere_id = $1 ORDER BY s.id`,
-                [req.utente.id]
+                [req.utente.barbiere_id]
             );
             return res.json({ utente: req.utente, sedi: sedi.rows });
         }
@@ -325,49 +342,85 @@ app.get('/api/auth/me', verificaToken, async (req, res) => {
     }
 });
 
-// Modifica profilo cliente
+// Modifica profilo (clienti e staff). I campi non inviati restano invariati.
 app.patch('/api/auth/profilo', verificaToken, async (req, res) => {
-    const { nome, cognome, telefono } = req.body;
+    const pulisci = (v, max) => (typeof v === 'string' ? v.trim().slice(0, max) : null);
+    const nome = pulisci(req.body.nome, 50);
+    const cognome = pulisci(req.body.cognome, 50);
+    const telefono = pulisci(req.body.telefono, 20);
+    if (nome === '') return res.status(400).json({ error: "Il nome non può essere vuoto" });
+
+    const client = await pool.connect();
     try {
+        await client.query('BEGIN');
+        const result = await client.query(
+            `UPDATE profili SET nome = COALESCE($1, nome), cognome = COALESCE($2, cognome), telefono = COALESCE($3, telefono)
+             WHERE id = $4 RETURNING nome, cognome`,
+            [nome, cognome, telefono, req.utente.uuid]
+        );
+        const aggiornato = result.rows[0];
+
         if (req.utente.ruolo === 'cliente') {
-            await pool.query('UPDATE profili SET nome=$1, cognome=$2, telefono=$3 WHERE id=$4', [nome, cognome, telefono, req.utente.id]);
-            // Aggiorna anche il nome nelle prenotazioni future
-            await pool.query("UPDATE prenotazioni SET cliente_nome=$1 WHERE cliente_id=$2 AND stato='attivo'", [nome, req.utente.id]);
-        } else {
-            await pool.query('UPDATE barbieri SET nome=$1 WHERE id=$2', [nome, req.utente.id]);
+            // Aggiorna anche il nome mostrato nelle prenotazioni attive
+            const nomeCompleto = [aggiornato.nome, aggiornato.cognome].filter(Boolean).join(' ').trim();
+            await client.query(
+                "UPDATE prenotazioni SET cliente_nome = $1 WHERE cliente_uuid = $2 AND stato = 'attivo'",
+                [nomeCompleto, req.utente.uuid]
+            );
+        } else if (req.utente.barbiere_id && nome) {
+            // Nome del barbiere mostrato ai clienti
+            await client.query('UPDATE barbieri SET nome = $1 WHERE id = $2', [nome, req.utente.barbiere_id]);
         }
-        res.json({ success: true });
+        await client.query('COMMIT');
+        tokenCache.delete(req.token); // i dati in cache sono cambiati
+        res.json({ success: true, nome: aggiornato.nome, cognome: aggiornato.cognome });
     } catch (err) {
+        await client.query('ROLLBACK');
+        console.error("Errore aggiornamento profilo:", err.message);
         res.status(500).json({ error: "Errore aggiornamento profilo" });
+    } finally {
+        client.release();
     }
 });
 
-// Cambia password
+// Cambia password (solo staff: i clienti accedono con codice OTP via email)
 app.patch('/api/auth/cambia-password', verificaToken, async (req, res) => {
     const { vecchia_password, nuova_password } = req.body;
     if (!vecchia_password || !nuova_password) return res.status(400).json({ error: "Compila tutti i campi" });
-    if (nuova_password.length < 6) return res.status(400).json({ error: "Minimo 6 caratteri" });
+    if (typeof nuova_password !== 'string' || nuova_password.length < 6) return res.status(400).json({ error: "Minimo 6 caratteri" });
+    if (req.utente.ruolo === 'cliente') {
+        return res.status(400).json({ error: "Accedi con il codice via email: non hai una password da cambiare" });
+    }
 
+    const authUrl = `${process.env.SUPABASE_URL}/auth/v1`;
+    const headers = { apikey: process.env.SUPABASE_ANON_KEY, 'Content-Type': 'application/json' };
     try {
-        let result;
-        if (req.utente.ruolo === 'cliente') {
-            result = await pool.query('SELECT password_hash FROM clienti WHERE id=$1', [req.utente.id]);
-        } else {
-            result = await pool.query('SELECT password_hash FROM barbieri WHERE id=$1', [req.utente.id]);
-        }
-        if (result.rows.length === 0) return res.status(404).json({ error: "Utente non trovato" });
+        // 1. Verifica la password attuale con un login: la sessione appena creata
+        //    soddisfa anche il requisito di "login recente" di Supabase
+        const login = await fetch(`${authUrl}/token?grant_type=password`, {
+            method: 'POST', headers,
+            body: JSON.stringify({ email: req.utente.email, password: vecchia_password }),
+        });
+        if (!login.ok) return res.status(401).json({ error: "Password attuale errata" });
+        const { access_token } = await login.json();
+        const authHeaders = { ...headers, Authorization: `Bearer ${access_token}` };
 
-        const valida = await bcrypt.compare(vecchia_password, result.rows[0].password_hash);
-        if (!valida) return res.status(401).json({ error: "Password attuale errata" });
+        // 2. Imposta la nuova password
+        const update = await fetch(`${authUrl}/user`, {
+            method: 'PUT', headers: authHeaders,
+            body: JSON.stringify({ password: nuova_password }),
+        });
 
-        const hash = await bcrypt.hash(nuova_password, 10);
-        if (req.utente.ruolo === 'cliente') {
-            await pool.query('UPDATE clienti SET password_hash=$1 WHERE id=$2', [hash, req.utente.id]);
-        } else {
-            await pool.query('UPDATE barbieri SET password_hash=$1 WHERE id=$2', [hash, req.utente.id]);
+        // 3. Chiude la sessione temporanea usata per la verifica
+        fetch(`${authUrl}/logout?scope=local`, { method: 'POST', headers: authHeaders }).catch(() => {});
+
+        if (!update.ok) {
+            const e = await update.json().catch(() => ({}));
+            return res.status(400).json({ error: e.msg || e.error_description || "Impossibile aggiornare la password" });
         }
         res.json({ success: true });
     } catch (err) {
+        console.error("Errore cambio password:", err.message);
         res.status(500).json({ error: "Errore cambio password" });
     }
 });
@@ -681,9 +734,10 @@ app.get('/api/admin/prenotazioni', verificaToken, soloAdmin, async (req, res) =>
              WHERE p.sede_id = $1 AND p.data = $2`;
         const params = [sede_id, dataQuery];
 
-        if (barbiere_id) {
+        const filtroBarbiere = barbiereScope(req.utente) ?? barbiere_id;
+        if (filtroBarbiere) {
             query += ` AND p.barbiere_id = $3`;
-            params.push(barbiere_id);
+            params.push(filtroBarbiere);
         }
         query += ` ORDER BY p.ora ASC`;
 
@@ -717,8 +771,10 @@ app.get('/api/admin/prenotazioni/settimana', verificaToken, soloAdmin, async (re
              JOIN barbieri b ON p.barbiere_id = b.id
              JOIN servizi sv ON p.servizio_id = sv.id
              LEFT JOIN profili pr ON pr.id = p.cliente_uuid
-             WHERE p.sede_id = $1 AND p.data BETWEEN $2 AND $3 ORDER BY p.data ASC, p.ora ASC`,
-            [sede_id, inizio.toISOString().split('T')[0], fine.toISOString().split('T')[0]]
+             WHERE p.sede_id = $1 AND p.data BETWEEN $2 AND $3
+               AND ($4::int IS NULL OR p.barbiere_id = $4)
+             ORDER BY p.data ASC, p.ora ASC`,
+            [sede_id, inizio.toISOString().split('T')[0], fine.toISOString().split('T')[0], barbiereScope(req.utente)]
         );
         res.json(result.rows);
     } catch (err) {
@@ -732,6 +788,7 @@ app.post('/api/admin/prenotazioni', verificaToken, soloAdmin, async (req, res) =
     if (!sede_id || !barbiere_id || !cliente_nome || !data || !ora || !servizio_id) {
         return res.status(400).json({ error: "Mancano campi obbligatori" });
     }
+    if (!puoGestireBarbiere(req.utente, barbiere_id)) return vietato(res);
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
@@ -769,6 +826,7 @@ app.patch('/api/admin/prenotazioni/:id', verificaToken, soloAdmin, async (req, r
         if (pren.rows.length === 0) return res.status(404).json({ error: "Non trovata" });
         const p = pren.rows[0];
         const newOra = ora || p.ora, newBarbiere = barbiere_id || p.barbiere_id, newData = data || p.data;
+        if (!puoGestireBarbiere(req.utente, p.barbiere_id) || !puoGestireBarbiere(req.utente, newBarbiere)) return vietato(res);
 
         const check = await pool.query(
             "SELECT id FROM prenotazioni WHERE barbiere_id=$1 AND data=$2 AND ora=$3 AND stato='attivo' AND id!=$4",
@@ -791,7 +849,10 @@ app.patch('/api/admin/prenotazioni/:id', verificaToken, soloAdmin, async (req, r
 app.delete('/api/admin/prenotazioni/:id', verificaToken, soloAdmin, async (req, res) => {
     const { id } = req.params;
     try {
-        const result = await pool.query("DELETE FROM prenotazioni WHERE id = $1 RETURNING *", [id]);
+        const result = await pool.query(
+            "DELETE FROM prenotazioni WHERE id = $1 AND ($2::int IS NULL OR barbiere_id = $2) RETURNING id",
+            [id, barbiereScope(req.utente)]
+        );
         if (result.rows.length === 0) return res.status(404).json({ error: "Non trovata" });
         res.json({ success: true });
     } catch (err) {
@@ -802,6 +863,7 @@ app.delete('/api/admin/prenotazioni/:id', verificaToken, soloAdmin, async (req, 
 // Lista barbieri (admin)
 app.get('/api/admin/barbieri', verificaToken, soloAdmin, async (req, res) => {
     const { sede_id } = req.query;
+    const scope = barbiereScope(req.utente);
     try {
         let result;
         if (sede_id) {
@@ -810,12 +872,15 @@ app.get('/api/admin/barbieri', verificaToken, soloAdmin, async (req, res) => {
                         array_agg(t.giorno_settimana ORDER BY t.giorno_settimana) AS giorni_lavoro
                  FROM barbieri b
                  JOIN turni_rotazione t ON b.id=t.barbiere_id
-                 WHERE t.sede_id=$1
+                 WHERE t.sede_id=$1 AND ($2::int IS NULL OR b.id = $2)
                  GROUP BY b.id, b.nome, b.tipo, b.assente, b.motivo_assenza
-                 ORDER BY b.nome`, [sede_id]
+                 ORDER BY b.nome`, [sede_id, scope]
             );
         } else {
-            result = await pool.query('SELECT id, nome, tipo, assente, motivo_assenza FROM barbieri ORDER BY nome');
+            result = await pool.query(
+                'SELECT id, nome, tipo, assente, motivo_assenza FROM barbieri WHERE ($1::int IS NULL OR id = $1) ORDER BY nome',
+                [scope]
+            );
         }
         res.json(result.rows);
     } catch (err) {
@@ -827,6 +892,7 @@ app.get('/api/admin/barbieri', verificaToken, soloAdmin, async (req, res) => {
 app.post('/api/admin/barbiere-assente', verificaToken, soloAdmin, async (req, res) => {
     const { barbiere_id, motivo, data_inizio, giorni } = req.body;
     if (!barbiere_id) return res.status(400).json({ error: "Manca barbiere_id" });
+    if (!puoGestireBarbiere(req.utente, barbiere_id)) return vietato(res);
 
     try {
         // Usa ora italiana — CURRENT_DATE/CURRENT_TIME sul server UTC darebbe orari sbagliati
@@ -917,6 +983,7 @@ app.post('/api/admin/barbiere-assente', verificaToken, soloAdmin, async (req, re
 app.post('/api/admin/barbiere-permesso', verificaToken, soloAdmin, async (req, res) => {
     const { barbiere_id, data_inizio, ora_inizio, minuti } = req.body;
     if (!barbiere_id || !minuti) return res.status(400).json({ error: "Manca barbiere_id o minuti" });
+    if (!puoGestireBarbiere(req.utente, barbiere_id)) return vietato(res);
     try {
         // Ora italiana corrente — evita shift UTC (server è UTC, Italia è UTC+2)
         const italianNow = new Date().toLocaleString('sv-SE', { timeZone: 'Europe/Rome' }).replace(' ', 'T');
@@ -996,6 +1063,7 @@ app.post('/api/admin/barbiere-permesso', verificaToken, soloAdmin, async (req, r
 app.post('/api/admin/barbiere-presente', verificaToken, soloAdmin, async (req, res) => {
     const { barbiere_id } = req.body;
     if (!barbiere_id) return res.status(400).json({ error: "Manca barbiere_id" });
+    if (!puoGestireBarbiere(req.utente, barbiere_id)) return vietato(res);
     try {
         const italianNow = new Date().toLocaleString('sv-SE', { timeZone: 'Europe/Rome' }).replace(' ', 'T');
         const italianDate = italianNow.slice(0, 10);
