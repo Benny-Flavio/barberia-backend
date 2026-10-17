@@ -4,11 +4,22 @@ const { Pool } = require('pg');
 require('dotenv').config();
 const cron = require('node-cron');
 const bcrypt = require('bcrypt');
-const jwt = require('jsonwebtoken');
+const rateLimit = require('express-rate-limit');
 
 const app = express();
+app.set('trust proxy', 1); // Render sta dietro un proxy: serve per leggere l'IP reale del client
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '10kb' }));
+
+// Rate limiting per IP: generale su tutte le API + più stretto sulle scritture
+app.use('/api', rateLimit({ windowMs: 60 * 1000, limit: 120, standardHeaders: 'draft-7', legacyHeaders: false }));
+const limiteScritture = rateLimit({
+    windowMs: 60 * 1000, limit: 20, standardHeaders: 'draft-7', legacyHeaders: false,
+    skip: (req) => req.method === 'GET',
+    message: { error: "Troppe richieste, riprova tra un minuto" },
+});
+app.use('/api/prenotazioni', limiteScritture);
+app.use('/api/auth', limiteScritture);
 
 // ==========================================
 // CONFIGURAZIONE DATABASE
@@ -295,93 +306,8 @@ cron.schedule('*/10 * * * *', async () => {
 });
 
 // ==========================================
-// AUTH: REGISTRAZIONE + LOGIN UNIFICATO
+// AUTH (login/registrazione gestiti da Supabase Auth lato client)
 // ==========================================
-
-// Registrazione cliente
-app.post('/api/auth/registrazione', async (req, res) => {
-    const { nome, cognome, email, telefono, password } = req.body;
-
-    if (!nome || !email || !password) {
-        return res.status(400).json({ error: "Nome, email e password sono obbligatori" });
-    }
-
-    try {
-        // Controlla che l'email non esista già tra clienti
-        const esistente = await pool.query('SELECT id FROM clienti WHERE email = $1', [email]);
-        if (esistente.rows.length > 0) {
-            return res.status(409).json({ error: "Questa email è già registrata" });
-        }
-
-        // Controlla che non sia un'email barbiere
-        const barbiere = await pool.query('SELECT id FROM barbieri WHERE email = $1', [email]);
-        if (barbiere.rows.length > 0) {
-            return res.status(409).json({ error: "Questa email è riservata" });
-        }
-
-        const hash = await bcrypt.hash(password, 10);
-        const result = await pool.query(
-            `INSERT INTO clienti (nome, cognome, email, telefono, password_hash) VALUES ($1, $2, $3, $4, $5) RETURNING id, nome, cognome, email`,
-            [nome, cognome || null, email, telefono || null, hash]
-        );
-
-        const cliente = result.rows[0];
-        const token = jwt.sign(
-            { id: cliente.id, nome: cliente.nome, email: cliente.email, ruolo: 'cliente' },
-            process.env.JWT_SECRET, { expiresIn: '30d' }
-        );
-
-        res.json({ success: true, token, utente: { ...cliente, ruolo: 'cliente' } });
-    } catch (err) {
-        console.error("Errore registrazione:", err);
-        res.status(500).json({ error: "Errore durante la registrazione" });
-    }
-});
-
-// Login unificato (clienti + barbieri)
-app.post('/api/auth/login', async (req, res) => {
-    const { email, password } = req.body;
-    if (!email || !password) return res.status(400).json({ error: "Inserisci email e password" });
-
-    try {
-        // 1. Cerca tra i barbieri
-        const barbiereResult = await pool.query('SELECT * FROM barbieri WHERE email = $1', [email]);
-        if (barbiereResult.rows.length > 0) {
-            const barbiere = barbiereResult.rows[0];
-            if (!barbiere.password_hash) return res.status(401).json({ error: "Password non configurata" });
-
-            const valida = await bcrypt.compare(password, barbiere.password_hash);
-            if (!valida) return res.status(401).json({ error: "Password errata" });
-
-            const token = jwt.sign(
-                { id: barbiere.id, nome: barbiere.nome, email: barbiere.email, tipo: barbiere.tipo, ruolo: 'barbiere' },
-                process.env.JWT_SECRET, { expiresIn: '30d' }
-            );
-            return res.json({ success: true, token, utente: { id: barbiere.id, nome: barbiere.nome, ruolo: 'barbiere', tipo: barbiere.tipo } });
-        }
-
-        // 2. Cerca tra i clienti
-        const clienteResult = await pool.query('SELECT * FROM clienti WHERE email = $1', [email]);
-        if (clienteResult.rows.length > 0) {
-            const cliente = clienteResult.rows[0];
-            if (!cliente.password_hash) return res.status(401).json({ error: "Password non configurata" });
-
-            const valida = await bcrypt.compare(password, cliente.password_hash);
-            if (!valida) return res.status(401).json({ error: "Password errata" });
-
-            const token = jwt.sign(
-                { id: cliente.id, nome: cliente.nome, email: cliente.email, ruolo: 'cliente' },
-                process.env.JWT_SECRET, { expiresIn: '30d' }
-            );
-            return res.json({ success: true, token, utente: { id: cliente.id, nome: cliente.nome, cognome: cliente.cognome, ruolo: 'cliente' } });
-        }
-
-        return res.status(401).json({ error: "Email non trovata" });
-    } catch (err) {
-        console.error("Errore login:", err);
-        res.status(500).json({ error: "Errore durante il login" });
-    }
-});
 
 // Verifica token (per auto-login)
 app.get('/api/auth/me', verificaToken, async (req, res) => {
@@ -396,21 +322,6 @@ app.get('/api/auth/me', verificaToken, async (req, res) => {
         res.json({ utente: req.utente });
     } catch (err) {
         res.status(500).json({ error: "Errore" });
-    }
-});
-
-// Setup password barbieri (chiamare UNA VOLTA)
-app.get('/api/admin/setup-passwords', async (req, res) => {
-    try {
-        const barbieri = await pool.query('SELECT id, nome FROM barbieri');
-        for (const b of barbieri.rows) {
-            const hash = await bcrypt.hash('barberia2024', 10);
-            await pool.query('UPDATE barbieri SET password_hash = $1 WHERE id = $2', [hash, b.id]);
-        }
-        res.json({ success: true, message: "Password impostate per tutti (password: barberia2024)" });
-    } catch (err) {
-        console.error("IL VERO ERRORE È:", err);
-        res.status(500).json({ error: "Errore setup" });
     }
 });
 
@@ -707,37 +618,17 @@ app.get('/api/prenotazioni/miei', verificaToken, async (req, res) => {
     }
 });
 
-// Cancella prenotazione (cliente)
+// Cancella prenotazione (cliente) — solo le proprie
 app.delete('/api/prenotazioni/:id', verificaToken, async (req, res) => {
     const { id } = req.params;
     try {
         const result = await pool.query(
-            "DELETE FROM prenotazioni WHERE id = $1 AND stato = 'attivo' RETURNING *", [id]
+            "DELETE FROM prenotazioni WHERE id = $1 AND cliente_uuid = $2 AND stato = 'attivo' RETURNING id", [id, req.utente.uuid]
         );
         if (result.rows.length === 0) return res.status(404).json({ error: "Non trovata o già cancellata" });
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: "Errore nella cancellazione" });
-    }
-});
-
-// DEBUG PUBBLICO (rimuovere dopo debug)
-app.get('/api/debug/info', async (req, res) => {
-    try {
-        const notifCols = await pool.query(`SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'notifiche' ORDER BY ordinal_position`);
-        const prenCols = await pool.query(`SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'prenotazioni' ORDER BY ordinal_position`);
-        const notifCount = await pool.query(`SELECT COUNT(*) FROM notifiche`);
-        const lastNotif = await pool.query(`SELECT id, cliente_uuid, LEFT(messaggio,60) AS msg, created_at FROM notifiche ORDER BY created_at DESC LIMIT 5`);
-        const lastPren = await pool.query(`SELECT id, data, ora, stato, cliente_uuid, cliente_nome FROM prenotazioni ORDER BY data DESC, ora DESC LIMIT 8`);
-        res.json({
-            notifiche_colonne: notifCols.rows,
-            prenotazioni_colonne: prenCols.rows,
-            notifiche_totali: notifCount.rows[0].count,
-            ultime_notifiche: lastNotif.rows,
-            ultime_prenotazioni: lastPren.rows
-        });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
     }
 });
 
