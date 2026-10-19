@@ -173,6 +173,59 @@ const puoGestireAssenze = (utente, barbiereId) =>
 const vietato = (res) => res.status(403).json({ error: "Puoi gestire solo le tue assenze e i tuoi permessi" });
 
 // ==========================================
+// DISPONIBILITÀ BARBIERE (assenze e permessi)
+// ==========================================
+const minuti = (hhmm) => { const [h, m] = hhmm.split(':').map(Number); return h * 60 + m; };
+
+// pg restituisce le colonne DATE come oggetti Date (mezzanotte locale)
+const dataStr = (d) => typeof d === 'string'
+    ? d.slice(0, 10)
+    : `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+
+// Per una data (YYYY-MM-DD): il barbiere è assente tutto il giorno? E in quali
+// finestre [inizio, fine) in minuti è in permesso? Vale sia per assenze/permessi
+// attivi sia per quelli programmati (motivo_assenza in formato JSON).
+const indisponibilita = (barbiere, data) => {
+    const libero = { giornoIntero: false, finestre: [] };
+    const tuttoIlGiorno = { giornoIntero: true, finestre: [] };
+    const motivo = barbiere.motivo_assenza;
+    let info = null;
+    if (motivo && motivo.startsWith('{')) {
+        try { info = JSON.parse(motivo); } catch { info = null; }
+    }
+    // Nessun dettaglio (motivo libero o formato legacy): conta solo il flag
+    if (!info) return barbiere.assente ? tuttoIlGiorno : libero;
+
+    if (info.tipo === 'assente') {
+        return data >= info.inizio && (!info.fine || data <= info.fine) ? tuttoIlGiorno : libero;
+    }
+    if (info.tipo === 'permesso' && info.inizio && info.fine && info.inizio.slice(0, 10) === data) {
+        const inizio = minuti(info.inizio.slice(11, 16));
+        let fine = minuti(info.fine.slice(11, 16));
+        if (fine <= inizio) fine = 24 * 60; // permesso oltre la mezzanotte
+        return { giornoIntero: false, finestre: [[inizio, fine]] };
+    }
+    return libero;
+};
+
+// Lo slot [ora, ora + durata servizio) non cade in un'assenza o in un permesso?
+const slotDisponibile = async (db, barbiereId, data, ora, servizioId) => {
+    const r = await db.query(
+        `SELECT b.assente, b.motivo_assenza, COALESCE(s.durata_minuti, 40) AS durata
+         FROM barbieri b LEFT JOIN servizi s ON s.id = $2 WHERE b.id = $1`,
+        [barbiereId, servizioId]
+    );
+    if (r.rows.length === 0) return false;
+    const { giornoIntero, finestre } = indisponibilita(r.rows[0], dataStr(data));
+    if (giornoIntero) return false;
+    const inizio = minuti(String(ora).slice(0, 5));
+    const fine = inizio + r.rows[0].durata;
+    return !finestre.some(([a, b]) => inizio < b && fine > a);
+};
+
+const nonDisponibile = (res) => res.status(409).json({ error: "Il barbiere non è disponibile in questo orario (assenza o permesso)" });
+
+// ==========================================
 // CRON JOB - Pulizia ogni 10 minuti
 // ==========================================
 cron.schedule('*/10 * * * *', async () => {
@@ -468,28 +521,14 @@ app.get('/api/barbieri-disponibili', async (req, res) => {
              WHERE t.sede_id = $1 AND t.giorno_settimana = $2`,
             [sede_id, giorno_settimana]
         );
-        // Calcola se un barbiere è disabilitato per la data richiesta (assente attivo o programmato)
-        const rows = result.rows.map((b) => {
-            let disabilitato = false;
-            if (b.assente) {
-                disabilitato = true;
-            } else if (b.motivo_assenza && b.motivo_assenza.startsWith('{')) {
-                try {
-                    const info = JSON.parse(b.motivo_assenza);
-                    if (info.stato === 'programmato') {
-                        if (info.tipo === 'assente') {
-                            disabilitato = data >= info.inizio && (!info.fine || data <= info.fine);
-                        } else if (info.tipo === 'permesso') {
-                            // Per il permesso programmato controlliamo solo la data (non l'ora)
-                            const permDate = new Date(info.inizio);
-                            const permDateStr = `${permDate.getFullYear()}-${String(permDate.getMonth()+1).padStart(2,'0')}-${String(permDate.getDate()).padStart(2,'0')}`;
-                            disabilitato = permDateStr === data;
-                        }
-                    }
-                } catch {}
-            }
-            return { id: b.id, nome: b.nome, assente: b.assente, disabilitato };
-        });
+        // Disabilitato = assente per l'intera giornata richiesta. Un permesso blocca solo
+        // la sua fascia oraria, che viene esclusa da /api/orari-disponibili.
+        const rows = result.rows.map((b) => ({
+            id: b.id,
+            nome: b.nome,
+            assente: b.assente,
+            disabilitato: indisponibilita(b, data).giornoIntero,
+        }));
         res.json(rows);
     } catch (err) {
         res.status(500).json({ error: "Errore durante la ricerca dei barbieri" });
@@ -531,6 +570,13 @@ app.get('/api/orari-disponibili', async (req, res) => {
             const inizio = h * 60 + m;
             return { inizio, fine: inizio + row.durata };
         });
+
+        // Assenze e permessi: giornata intera = nessuno slot, permesso = fascia occupata
+        const barbRes = await pool.query('SELECT assente, motivo_assenza FROM barbieri WHERE id = $1', [barbiere_id]);
+        if (barbRes.rows.length === 0) return res.json([]);
+        const { giornoIntero, finestre } = indisponibilita(barbRes.rows[0], data);
+        if (giornoIntero) return res.json([]);
+        for (const [inizio, fine] of finestre) intervalliOccupati.push({ inizio, fine });
 
         // Costruisci gli slot disponibili partendo dagli spazi liberi
         const disponibili = [];
@@ -605,6 +651,10 @@ app.post('/api/prenotazioni', verificaToken, async (req, res) => {
         if (check.rows.length > 0) {
             await client.query('ROLLBACK');
             return res.status(409).json({ error: "Questo orario è già prenotato!" });
+        }
+        if (!(await slotDisponibile(client, barbiere_id, data, ora, servizio_id))) {
+            await client.query('ROLLBACK');
+            return nonDisponibile(res);
         }
         const result = await client.query(
             `INSERT INTO prenotazioni (sede_id, barbiere_id, cliente_nome, cliente_uuid, data, ora, servizio_id)
@@ -782,6 +832,10 @@ app.post('/api/admin/prenotazioni', verificaToken, soloAdmin, async (req, res) =
             await client.query('ROLLBACK');
             return res.status(409).json({ error: "Orario già prenotato!" });
         }
+        if (!(await slotDisponibile(client, barbiere_id, data, ora, servizio_id))) {
+            await client.query('ROLLBACK');
+            return nonDisponibile(res);
+        }
         const result = await client.query(
             `INSERT INTO prenotazioni (sede_id, barbiere_id, cliente_nome, cliente_telefono, data, ora, servizio_id) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
             [sede_id, barbiere_id, cliente_nome, cliente_telefono || null, data, ora, servizio_id]
@@ -814,6 +868,7 @@ app.patch('/api/admin/prenotazioni/:id', verificaToken, soloAdmin, async (req, r
             [newBarbiere, newData, newOra, id]
         );
         if (check.rows.length > 0) return res.status(409).json({ error: "Nuovo orario già occupato!" });
+        if (!(await slotDisponibile(pool, newBarbiere, newData, newOra, p.servizio_id))) return nonDisponibile(res);
 
         const result = await pool.query(
             `UPDATE prenotazioni SET ora=$1, barbiere_id=$2, data=$3 WHERE id=$4 AND stato='attivo' RETURNING *`,
