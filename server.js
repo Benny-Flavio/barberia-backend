@@ -173,57 +173,164 @@ const puoGestireAssenze = (utente, barbiereId) =>
 const vietato = (res) => res.status(403).json({ error: "Puoi gestire solo le tue assenze e i tuoi permessi" });
 
 // ==========================================
-// DISPONIBILITÀ BARBIERE (assenze e permessi)
+// ASSENZE E PERMESSI (tabella assenze: N record per barbiere)
 // ==========================================
-const minuti = (hhmm) => { const [h, m] = hhmm.split(':').map(Number); return h * 60 + m; };
+// tipo 'assente':  giornate intere da data_inizio a data_fine (NULL = senza fine)
+// tipo 'permesso': fascia [ora_inizio, ora_fine) nel giorno data_inizio (= data_fine)
+const minuti = (hhmm) => { const [h, m] = String(hhmm).slice(0, 5).split(':').map(Number); return h * 60 + m; };
+const hhmm = (min) => `${String(Math.floor(min / 60)).padStart(2, '0')}:${String(min % 60).padStart(2, '0')}`;
 
 // pg restituisce le colonne DATE come oggetti Date (mezzanotte locale)
 const dataStr = (d) => typeof d === 'string'
     ? d.slice(0, 10)
     : `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 
-// Per una data (YYYY-MM-DD): il barbiere è assente tutto il giorno? E in quali
-// finestre [inizio, fine) in minuti è in permesso? Vale sia per assenze/permessi
-// attivi sia per quelli programmati (motivo_assenza in formato JSON).
-const indisponibilita = (barbiere, data) => {
-    const libero = { giornoIntero: false, finestre: [] };
-    const tuttoIlGiorno = { giornoIntero: true, finestre: [] };
-    const motivo = barbiere.motivo_assenza;
-    let info = null;
-    if (motivo && motivo.startsWith('{')) {
-        try { info = JSON.parse(motivo); } catch { info = null; }
-    }
-    // Nessun dettaglio (motivo libero o formato legacy): conta solo il flag
-    if (!info) return barbiere.assente ? tuttoIlGiorno : libero;
-
-    if (info.tipo === 'assente') {
-        return data >= info.inizio && (!info.fine || data <= info.fine) ? tuttoIlGiorno : libero;
-    }
-    if (info.tipo === 'permesso' && info.inizio && info.fine && info.inizio.slice(0, 10) === data) {
-        const inizio = minuti(info.inizio.slice(11, 16));
-        let fine = minuti(info.fine.slice(11, 16));
-        if (fine <= inizio) fine = 24 * 60; // permesso oltre la mezzanotte
-        return { giornoIntero: false, finestre: [[inizio, fine]] };
-    }
-    return libero;
+// Data e ora correnti in Italia (il server gira in UTC)
+const oraItalia = () => {
+    const adesso = new Date().toLocaleString('sv-SE', { timeZone: 'Europe/Rome' }).replace(' ', 'T');
+    return { data: adesso.slice(0, 10), ora: adesso.slice(11, 16) };
 };
+
+const GIORNI = ['Domenica', 'Lunedì', 'Martedì', 'Mercoledì', 'Giovedì', 'Venerdì', 'Sabato'];
+const MESI = ['Gennaio', 'Febbraio', 'Marzo', 'Aprile', 'Maggio', 'Giugno', 'Luglio', 'Agosto', 'Settembre', 'Ottobre', 'Novembre', 'Dicembre'];
+const fmtData = (d) => {
+    const [y, m, g] = dataStr(d).split('-').map(Number);
+    const x = new Date(y, m - 1, g);
+    return `${GIORNI[x.getDay()]} ${x.getDate()} ${MESI[x.getMonth()]}`;
+};
+
+const COLONNE_ASSENZA = `id, barbiere_id, tipo, data_inizio::text AS data_inizio, data_fine::text AS data_fine,
+    to_char(ora_inizio, 'HH24:MI') AS ora_inizio, to_char(ora_fine, 'HH24:MI') AS ora_fine, motivo`;
+
+// Assenze/permessi che toccano una data, raggruppati per barbiere
+const assenzeDelGiorno = async (db, barbiereIds, data) => {
+    const ids = barbiereIds.map(Number);
+    const perBarbiere = new Map(ids.map((id) => [id, []]));
+    if (ids.length === 0) return perBarbiere;
+    const r = await db.query(
+        `SELECT ${COLONNE_ASSENZA} FROM assenze
+         WHERE barbiere_id = ANY($1::int[]) AND data_inizio <= $2::date AND COALESCE(data_fine, 'infinity') >= $2::date`,
+        [ids, data]
+    );
+    for (const a of r.rows) perBarbiere.get(a.barbiere_id)?.push(a);
+    return perBarbiere;
+};
+
+// Da tutte le assenze/permessi di un giorno: assente tutto il giorno? E le fasce [inizio, fine)
+// in minuti di OGNI permesso (possono essere più di uno nello stesso giorno)
+const indisponibilita = (assenze = []) => ({
+    giornoIntero: assenze.some((a) => a.tipo === 'assente'),
+    finestre: assenze.filter((a) => a.tipo === 'permesso').map((a) => [minuti(a.ora_inizio), minuti(a.ora_fine)]),
+});
 
 // Lo slot [ora, ora + durata servizio) non cade in un'assenza o in un permesso?
 const slotDisponibile = async (db, barbiereId, data, ora, servizioId) => {
-    const r = await db.query(
-        `SELECT b.assente, b.motivo_assenza, COALESCE(s.durata_minuti, 40) AS durata
-         FROM barbieri b LEFT JOIN servizi s ON s.id = $2 WHERE b.id = $1`,
-        [barbiereId, servizioId]
-    );
-    if (r.rows.length === 0) return false;
-    const { giornoIntero, finestre } = indisponibilita(r.rows[0], dataStr(data));
+    const b = await db.query('SELECT 1 FROM barbieri WHERE id = $1', [barbiereId]);
+    if (b.rows.length === 0) return false;
+    const s = await db.query('SELECT durata_minuti FROM servizi WHERE id = $1', [servizioId]);
+    const durata = s.rows[0]?.durata_minuti || 40;
+    const assenze = (await assenzeDelGiorno(db, [barbiereId], dataStr(data))).get(Number(barbiereId));
+    const { giornoIntero, finestre } = indisponibilita(assenze);
     if (giornoIntero) return false;
-    const inizio = minuti(String(ora).slice(0, 5));
-    const fine = inizio + r.rows[0].durata;
-    return !finestre.some(([a, b]) => inizio < b && fine > a);
+    const inizio = minuti(ora);
+    const fine = inizio + durata;
+    return !finestre.some(([a, z]) => inizio < z && fine > a);
 };
 
 const nonDisponibile = (res) => res.status(409).json({ error: "Il barbiere non è disponibile in questo orario (assenza o permesso)" });
+
+const descriviAssenza = (a) => {
+    if (a.tipo === 'permesso') return `un permesso ${fmtData(a.data_inizio)} dalle ${a.ora_inizio} alle ${a.ora_fine}`;
+    return a.data_fine
+        ? `un'assenza dal ${fmtData(a.data_inizio)} al ${fmtData(a.data_fine)}`
+        : `un'assenza dal ${fmtData(a.data_inizio)} senza data di fine`;
+};
+
+// Un'assenza/permesso nuovo si sovrappone a uno già registrato per lo stesso barbiere?
+// Un'assenza intera non può coesistere con nulla nelle stesse date; due permessi sì,
+// purché gli orari non si accavallino.
+const trovaSovrapposizione = async (db, nuova) => {
+    const r = await db.query(
+        `SELECT ${COLONNE_ASSENZA} FROM assenze
+         WHERE barbiere_id = $1 AND data_inizio <= COALESCE($3::date, 'infinity') AND COALESCE(data_fine, 'infinity') >= $2::date
+         ORDER BY data_inizio, ora_inizio`,
+        [nuova.barbiere_id, nuova.data_inizio, nuova.data_fine]
+    );
+    return r.rows.find((a) =>
+        a.tipo === 'assente' || nuova.tipo === 'assente' ||
+        (minuti(a.ora_inizio) < minuti(nuova.ora_fine) && minuti(a.ora_fine) > minuti(nuova.ora_inizio))
+    ) || null;
+};
+
+// Cancella (stato 'cancellato', non elimina) gli appuntamenti futuri che cadono nell'assenza/permesso
+// e avvisa i clienti. Restano collegati all'assenza per ripristinarli se viene annullata.
+const cancellaPerAssenza = async (db, a) => {
+    const { data: oggi, ora } = oraItalia();
+    const params = [a.barbiere_id, oggi, ora, a.data_inizio];
+    let filtro;
+    if (a.tipo === 'assente') {
+        filtro = `AND p.data >= $4::date AND p.data <= COALESCE($5::date, 'infinity')`;
+        params.push(a.data_fine);
+    } else {
+        // Permesso: ogni appuntamento che si sovrappone alla fascia, considerando la durata del servizio
+        filtro = `AND p.data = $4::date AND p.ora < $5::time
+                  AND p.ora + make_interval(mins => COALESCE(sv.durata_minuti, 40)) > $6::time`;
+        params.push(a.ora_fine, a.ora_inizio);
+    }
+    const r = await db.query(
+        `SELECT p.id, p.cliente_uuid, p.data, p.ora, b.nome AS barbiere_nome, sv.nome AS servizio_nome
+         FROM prenotazioni p
+         JOIN barbieri b ON b.id = p.barbiere_id
+         JOIN servizi sv ON sv.id = p.servizio_id
+         WHERE p.barbiere_id = $1 AND p.stato = 'attivo'
+           AND (p.data > $2::date OR (p.data = $2::date AND p.ora >= $3::time)) ${filtro}`,
+        params
+    );
+    const perche = a.tipo === 'permesso' ? 'il barbiere è in permesso' : 'il barbiere non è disponibile';
+    let notificati = 0;
+    for (const app of r.rows) {
+        await db.query("UPDATE prenotazioni SET stato = 'cancellato', cancellata_da_assenza = $2 WHERE id = $1", [app.id, a.id]);
+        if (app.cliente_uuid) {
+            const messaggio = `Ci scusiamo per il disagio. Il tuo appuntamento di **${fmtData(app.data)}** alle **${String(app.ora).slice(0, 5)}** con **${app.barbiere_nome}** per il servizio di **${app.servizio_nome}** è stato cancellato perché ${perche}.\n\nTi invitiamo a prenotare un nuovo appuntamento.`;
+            await db.query('INSERT INTO notifiche (cliente_uuid, messaggio) VALUES ($1, $2)', [app.cliente_uuid, messaggio]);
+            notificati++;
+        }
+    }
+    return { cancellati: r.rows.length, notificati };
+};
+
+// Annulla un'assenza/permesso: ripristina gli appuntamenti futuri che aveva cancellato
+// (se lo slot è ancora libero), avvisa i clienti ed elimina il record.
+const annullaAssenza = async (db, a) => {
+    const { data: oggi, ora } = oraItalia();
+    const r = await db.query(
+        `SELECT p.id, p.cliente_uuid, p.data, p.ora, b.nome AS barbiere_nome, sv.nome AS servizio_nome
+         FROM prenotazioni p
+         JOIN barbieri b ON b.id = p.barbiere_id
+         JOIN servizi sv ON sv.id = p.servizio_id
+         WHERE p.cancellata_da_assenza = $1 AND p.stato = 'cancellato'
+           AND (p.data > $2::date OR (p.data = $2::date AND p.ora >= $3::time))`,
+        [a.id, oggi, ora]
+    );
+    let ripristinati = 0;
+    for (const app of r.rows) {
+        const u = await db.query(
+            `UPDATE prenotazioni p SET stato = 'attivo', cancellata_da_assenza = NULL
+             WHERE p.id = $1 AND NOT EXISTS (
+                 SELECT 1 FROM prenotazioni q
+                 WHERE q.barbiere_id = p.barbiere_id AND q.data = p.data AND q.ora = p.ora AND q.stato = 'attivo')`,
+            [app.id]
+        );
+        if (u.rowCount === 0) continue;
+        ripristinati++;
+        if (app.cliente_uuid) {
+            const messaggio = `Buone notizie! Il tuo appuntamento di **${fmtData(app.data)}** alle **${String(app.ora).slice(0, 5)}** con **${app.barbiere_nome}** per il servizio di **${app.servizio_nome}** è stato ripristinato. Il barbiere è nuovamente disponibile.\n\nTi aspettiamo!`;
+            await db.query('INSERT INTO notifiche (cliente_uuid, messaggio) VALUES ($1, $2)', [app.cliente_uuid, messaggio]);
+        }
+    }
+    await db.query('DELETE FROM assenze WHERE id = $1', [a.id]);
+    return ripristinati;
+};
 
 // ==========================================
 // CRON JOB - Pulizia ogni 10 minuti
@@ -235,134 +342,13 @@ cron.schedule('*/10 * * * *', async () => {
         const totale = (cancellati.rowCount || 0) + (passati.rowCount || 0);
         if (totale > 0) console.log(`Pulizia: eliminati ${totale} appuntamenti`);
 
-        // Ora italiana corrente come stringa locale (YYYY-MM-DDTHH:MM:SS) — evita problemi UTC
-        const italianNow = new Date().toLocaleString('sv-SE', { timeZone: 'Europe/Rome' }).replace(' ', 'T');
-
-        // Riattiva barbieri con assenza/permesso scaduto (formato JSON)
-        const attiviBarbieri = await pool.query(
-            `SELECT id, motivo_assenza FROM barbieri WHERE assente = true AND motivo_assenza IS NOT NULL`
+        // Assenze e permessi ormai conclusi. Non serve "attivarli": gli appuntamenti
+        // vengono cancellati nel momento in cui l'assenza/permesso viene registrato.
+        const scadute = await pool.query(
+            `DELETE FROM assenze WHERE COALESCE(data_fine, 'infinity') < $1::date`,
+            [oraItalia().data]
         );
-        for (const b of attiviBarbieri.rows) {
-            try {
-                if (b.motivo_assenza.startsWith('{')) {
-                    const info = JSON.parse(b.motivo_assenza);
-                    if (info.tipo === 'permesso' && info.fine <= italianNow) {
-                        await pool.query('UPDATE barbieri SET assente = false, motivo_assenza = NULL WHERE id = $1', [b.id]);
-                        console.log(`Permesso scaduto: riattivato barbiere ${b.id}`);
-                    } else if (info.tipo === 'assente' && info.fine) {
-                        if ((info.fine + 'T23:59:59') < italianNow) {
-                            await pool.query('UPDATE barbieri SET assente = false, motivo_assenza = NULL WHERE id = $1', [b.id]);
-                            console.log(`Assenza scaduta: riattivato barbiere ${b.id}`);
-                        }
-                    }
-                } else if (b.motivo_assenza.startsWith('permesso:')) {
-                    // Retrocompatibilità formato vecchio
-                    if (new Date(b.motivo_assenza.substring(9)) < new Date()) {
-                        await pool.query('UPDATE barbieri SET assente = false, motivo_assenza = NULL WHERE id = $1', [b.id]);
-                        console.log(`Permesso (legacy) scaduto: riattivato barbiere ${b.id}`);
-                    }
-                }
-            } catch (e) { /* skip barbieri con motivo_assenza non parsabile */ }
-        }
-
-        // Attiva assenze/permessi programmati il cui inizio è arrivato
-        const programmati = await pool.query(
-            `SELECT id, motivo_assenza FROM barbieri WHERE assente = false AND motivo_assenza IS NOT NULL AND motivo_assenza LIKE '{%'`
-        );
-        for (const b of programmati.rows) {
-            try {
-                const info = JSON.parse(b.motivo_assenza);
-                if (info.stato !== 'programmato') continue;
-                const inizioStr = info.tipo === 'assente'
-                    ? info.inizio + 'T00:00:00'
-                    : info.inizio;
-                if (inizioStr <= italianNow) {
-                    info.stato = 'attivo';
-                    await pool.query('UPDATE barbieri SET assente = true, motivo_assenza = $1 WHERE id = $2',
-                        [JSON.stringify(info), b.id]);
-                    if (info.tipo === 'assente') {
-                        const params = [b.id];
-                        let cancelQuery = `SELECT p.id, p.cliente_uuid, p.data, p.ora, bv.nome AS barbiere_nome, sv.nome AS servizio_nome
-                            FROM prenotazioni p
-                            JOIN barbieri bv ON p.barbiere_id = bv.id
-                            JOIN servizi sv ON p.servizio_id = sv.id
-                            WHERE p.barbiere_id = $1 AND p.stato = 'attivo'
-                            AND (p.data > CURRENT_DATE OR (p.data = CURRENT_DATE AND p.ora > CURRENT_TIME))`;
-                        if (info.fine) { cancelQuery += ` AND p.data <= $2`; params.push(info.fine); }
-                        const apps = await pool.query(cancelQuery, params);
-                        for (const app of apps.rows) {
-                            if (app.cliente_uuid) {
-                                const dateObj = new Date(app.data);
-                                const giorni = ['Dom','Lun','Mar','Mer','Gio','Ven','Sab'];
-                                const mesi = ['Gennaio','Febbraio','Marzo','Aprile','Maggio','Giugno','Luglio','Agosto','Settembre','Ottobre','Novembre','Dicembre'];
-                                const dataFmt = `${giorni[dateObj.getDay()]} ${dateObj.getDate()} ${mesi[dateObj.getMonth()]}`;
-                                const messaggio = `Ci scusiamo per il disagio. Il tuo appuntamento di **${dataFmt}** alle **${app.ora.slice(0,5)}** con **${app.barbiere_nome}** per il servizio di **${app.servizio_nome}** è stato cancellato perché il barbiere non è disponibile.\n\nTi invitiamo a prenotare un nuovo appuntamento.`;
-                                await pool.query('INSERT INTO notifiche (cliente_uuid, messaggio) VALUES ($1, $2)', [app.cliente_uuid, messaggio]);
-                            }
-                        }
-                        // Notifica clienti prima di marcare cancellato
-                        const appAssParams = [b.id];
-                        let appAssQuery = `SELECT p.id, p.cliente_uuid, p.data, p.ora, bv.nome AS barbiere_nome, sv.nome AS servizio_nome
-                            FROM prenotazioni p
-                            JOIN barbieri bv ON p.barbiere_id = bv.id
-                            JOIN servizi sv ON p.servizio_id = sv.id
-                            WHERE p.barbiere_id = $1 AND p.stato = 'attivo'
-                            AND (p.data > CURRENT_DATE OR (p.data = CURRENT_DATE AND p.ora > CURRENT_TIME))`;
-                        if (info.fine) { appAssQuery += ` AND p.data <= $2`; appAssParams.push(info.fine); }
-                        const appAssRows = await pool.query(appAssQuery, appAssParams);
-                        for (const app of appAssRows.rows) {
-                            if (app.cliente_uuid) {
-                                const dateObj = new Date(app.data);
-                                const giorni = ['Dom','Lun','Mar','Mer','Gio','Ven','Sab'];
-                                const mesi = ['Gennaio','Febbraio','Marzo','Aprile','Maggio','Giugno','Luglio','Agosto','Settembre','Ottobre','Novembre','Dicembre'];
-                                const dataFmt = `${giorni[dateObj.getDay()]} ${dateObj.getDate()} ${mesi[dateObj.getMonth()]}`;
-                                const msg = `Ci scusiamo per il disagio. Il tuo appuntamento di **${dataFmt}** alle **${app.ora.slice(0,5)}** con **${app.barbiere_nome}** per il servizio di **${app.servizio_nome}** è stato cancellato perché il barbiere non è disponibile.\n\nTi invitiamo a prenotare un nuovo appuntamento.`;
-                                await pool.query('INSERT INTO notifiche (cliente_uuid, messaggio) VALUES ($1, $2)', [app.cliente_uuid, msg]);
-                            }
-                        }
-                        // Marca cancellato (non elimina) — così è ripristinabile alla riattivazione
-                        const delParams = [b.id];
-                        let delQuery = `UPDATE prenotazioni SET stato = 'cancellato'
-                            WHERE barbiere_id = $1 AND stato = 'attivo'
-                            AND (data > CURRENT_DATE OR (data = CURRENT_DATE AND ora > CURRENT_TIME))`;
-                        if (info.fine) { delQuery += ` AND data <= $2`; delParams.push(info.fine); }
-                        const eliminati = await pool.query(delQuery, delParams);
-                        console.log(`Assenza programmata attivata per barbiere ${b.id}: cancellati ${eliminati.rowCount} appuntamenti`);
-                    } else {
-                        // Permesso: cancella appuntamenti nella finestra e notifica i clienti
-                        const oraInizioP = info.inizio.slice(11, 16);
-                        const oraFineP = info.fine.slice(11, 16);
-                        const dataP = info.inizio.slice(0, 10);
-                        const appsP = await pool.query(
-                            `SELECT p.id, p.cliente_uuid, p.data, p.ora, bv.nome AS barbiere_nome, sv.nome AS servizio_nome
-                             FROM prenotazioni p
-                             JOIN barbieri bv ON p.barbiere_id = bv.id
-                             JOIN servizi sv ON p.servizio_id = sv.id
-                             WHERE p.barbiere_id = $1 AND p.data = $2 AND p.stato = 'attivo'
-                             AND p.ora >= $3 AND p.ora < $4`,
-                            [b.id, dataP, oraInizioP, oraFineP]
-                        );
-                        for (const app of appsP.rows) {
-                            if (app.cliente_uuid) {
-                                const dateObj = new Date(app.data);
-                                const giorni = ['Dom','Lun','Mar','Mer','Gio','Ven','Sab'];
-                                const mesi = ['Gennaio','Febbraio','Marzo','Aprile','Maggio','Giugno','Luglio','Agosto','Settembre','Ottobre','Novembre','Dicembre'];
-                                const dataFmt = `${giorni[dateObj.getDay()]} ${dateObj.getDate()} ${mesi[dateObj.getMonth()]}`;
-                                const msg = `Ci scusiamo per il disagio. Il tuo appuntamento di **${dataFmt}** alle **${app.ora.slice(0,5)}** con **${app.barbiere_nome}** per il servizio di **${app.servizio_nome}** è stato cancellato perché il barbiere è in permesso.\n\nTi invitiamo a prenotare un nuovo appuntamento.`;
-                                await pool.query('INSERT INTO notifiche (cliente_uuid, messaggio) VALUES ($1, $2)', [app.cliente_uuid, msg]);
-                            }
-                        }
-                        await pool.query(
-                            `UPDATE prenotazioni SET stato = 'cancellato'
-                             WHERE barbiere_id = $1 AND data = $2 AND stato = 'attivo'
-                             AND ora >= $3 AND ora < $4`,
-                            [b.id, dataP, oraInizioP, oraFineP]
-                        );
-                        console.log(`Permesso programmato attivato per barbiere ${b.id}: cancellati ${appsP.rowCount} appuntamenti`);
-                    }
-                }
-            } catch (e) { console.error('Errore attivazione programmato:', e); }
-        }
+        if (scadute.rowCount > 0) console.log(`Pulizia: eliminate ${scadute.rowCount} assenze/permessi conclusi`);
     } catch (err) {
         console.error('Errore pulizia:', err);
     }
@@ -497,7 +483,7 @@ app.get('/api/barbieri/:sede_id', async (req, res) => {
         const result = await pool.query(
             `SELECT DISTINCT b.id, b.nome FROM barbieri b
              JOIN turni_rotazione t ON b.id = t.barbiere_id
-             WHERE t.sede_id = $1 AND b.assente = false`,
+             WHERE t.sede_id = $1`,
             [sede_id]
         );
         res.json(result.rows);
@@ -516,19 +502,18 @@ app.get('/api/barbieri-disponibili', async (req, res) => {
         if (giorno_settimana === 0 || giorno_settimana === 1) return res.json({ messaggio: "Il negozio è chiuso di Domenica e Lunedì", barbieri: [] });
 
         const result = await pool.query(
-            `SELECT b.id, b.nome, b.assente, b.motivo_assenza FROM barbieri b
+            `SELECT b.id, b.nome FROM barbieri b
              JOIN turni_rotazione t ON b.id = t.barbiere_id
              WHERE t.sede_id = $1 AND t.giorno_settimana = $2`,
             [sede_id, giorno_settimana]
         );
-        // Disabilitato = assente per l'intera giornata richiesta. Un permesso blocca solo
-        // la sua fascia oraria, che viene esclusa da /api/orari-disponibili.
-        const rows = result.rows.map((b) => ({
-            id: b.id,
-            nome: b.nome,
-            assente: b.assente,
-            disabilitato: indisponibilita(b, data).giornoIntero,
-        }));
+        // Disabilitato = assente per l'intera giornata richiesta. I permessi bloccano solo
+        // le loro fasce orarie, escluse da /api/orari-disponibili.
+        const assenze = await assenzeDelGiorno(pool, result.rows.map((b) => b.id), data);
+        const rows = result.rows.map((b) => {
+            const { giornoIntero } = indisponibilita(assenze.get(b.id));
+            return { id: b.id, nome: b.nome, assente: giornoIntero, disabilitato: giornoIntero };
+        });
         res.json(rows);
     } catch (err) {
         res.status(500).json({ error: "Errore durante la ricerca dei barbieri" });
@@ -571,10 +556,11 @@ app.get('/api/orari-disponibili', async (req, res) => {
             return { inizio, fine: inizio + row.durata };
         });
 
-        // Assenze e permessi: giornata intera = nessuno slot, permesso = fascia occupata
-        const barbRes = await pool.query('SELECT assente, motivo_assenza FROM barbieri WHERE id = $1', [barbiere_id]);
-        if (barbRes.rows.length === 0) return res.json([]);
-        const { giornoIntero, finestre } = indisponibilita(barbRes.rows[0], data);
+        // Assenze e permessi: giornata intera = nessuno slot, OGNI permesso del giorno = fascia occupata
+        const esiste = await pool.query('SELECT 1 FROM barbieri WHERE id = $1', [barbiere_id]);
+        if (esiste.rows.length === 0) return res.json([]);
+        const assenze = (await assenzeDelGiorno(pool, [barbiere_id], data)).get(Number(barbiere_id));
+        const { giornoIntero, finestre } = indisponibilita(assenze);
         if (giornoIntero) return res.json([]);
         for (const [inizio, fine] of finestre) intervalliOccupati.push({ inizio, fine });
 
@@ -893,253 +879,172 @@ app.delete('/api/admin/prenotazioni/:id', verificaToken, soloAdmin, async (req, 
     }
 });
 
-// Lista barbieri (admin)
+// Lista barbieri (admin), ognuno con le sue assenze/permessi in corso e futuri
 app.get('/api/admin/barbieri', verificaToken, soloAdmin, async (req, res) => {
     const { sede_id } = req.query;
     try {
         let result;
         if (sede_id) {
             result = await pool.query(
-                `SELECT b.id, b.nome, b.tipo, b.assente, b.motivo_assenza,
+                `SELECT b.id, b.nome, b.tipo,
                         array_agg(t.giorno_settimana ORDER BY t.giorno_settimana) AS giorni_lavoro
                  FROM barbieri b
                  JOIN turni_rotazione t ON b.id=t.barbiere_id
                  WHERE t.sede_id=$1
-                 GROUP BY b.id, b.nome, b.tipo, b.assente, b.motivo_assenza
+                 GROUP BY b.id, b.nome, b.tipo
                  ORDER BY b.nome`, [sede_id]
             );
         } else {
-            result = await pool.query('SELECT id, nome, tipo, assente, motivo_assenza FROM barbieri ORDER BY nome');
+            result = await pool.query('SELECT id, nome, tipo FROM barbieri ORDER BY nome');
         }
-        res.json(result.rows);
+        const ids = result.rows.map((b) => b.id);
+        const assenze = ids.length === 0 ? { rows: [] } : await pool.query(
+            `SELECT ${COLONNE_ASSENZA} FROM assenze
+             WHERE barbiere_id = ANY($1::int[]) AND COALESCE(data_fine, 'infinity') >= $2::date
+             ORDER BY data_inizio, ora_inizio NULLS FIRST`,
+            [ids, oraItalia().data]
+        );
+        res.json(result.rows.map((b) => ({ ...b, assenze: assenze.rows.filter((a) => a.barbiere_id === b.id) })));
     } catch (err) {
         res.status(500).json({ error: "Errore" });
     }
 });
 
-// SEGNA BARBIERE COME ASSENTE (con data e durata opzionale)
+// Registra una nuova assenza/permesso: sempre un nuovo record (INSERT), rifiutato solo se si
+// sovrappone a uno esistente. Gli appuntamenti futuri nel periodo vengono cancellati subito.
+const registraAssenza = async (res, nuova, motivo) => {
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        // Serializza le scritture sulle assenze dello stesso barbiere (due inserimenti paralleli sovrapposti)
+        await client.query('SELECT pg_advisory_xact_lock($1::bigint)', [nuova.barbiere_id]);
+        const conflitto = await trovaSovrapposizione(client, nuova);
+        if (conflitto) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ error: `Questo barbiere ha già ${descriviAssenza(conflitto)}: gli orari si sovrappongono.` });
+        }
+        const ins = await client.query(
+            `INSERT INTO assenze (barbiere_id, tipo, data_inizio, data_fine, ora_inizio, ora_fine, motivo)
+             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING ${COLONNE_ASSENZA}`,
+            [nuova.barbiere_id, nuova.tipo, nuova.data_inizio, nuova.data_fine, nuova.ora_inizio || null, nuova.ora_fine || null, motivo || null]
+        );
+        const assenza = ins.rows[0];
+        const { cancellati, notificati } = await cancellaPerAssenza(client, assenza);
+        await client.query('COMMIT');
+        const cosa = assenza.tipo === 'permesso' ? 'Permesso registrato' : 'Assenza registrata';
+        res.json({
+            success: true,
+            assenza,
+            eliminati: cancellati,
+            notifiche_inviate: notificati,
+            messaggio: cancellati > 0
+                ? `${cosa}. ${cancellati} appuntamenti cancellati e ${notificati} clienti notificati.`
+                : `${cosa}.`,
+        });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error("Errore registrazione assenza:", err.message);
+        res.status(500).json({ error: "Errore nel salvataggio dell'assenza/permesso" });
+    } finally {
+        client.release();
+    }
+};
+
+const DATA_RE = /^\d{4}-\d{2}-\d{2}$/;
+const ORA_RE = /^\d{2}:\d{2}$/;
+
+// ASSENZA (giornate intere, con data e durata in giorni opzionale; senza durata = senza fine)
 app.post('/api/admin/barbiere-assente', verificaToken, soloAdmin, async (req, res) => {
     const { barbiere_id, motivo, data_inizio, giorni } = req.body;
     if (!barbiere_id) return res.status(400).json({ error: "Manca barbiere_id" });
     if (!puoGestireAssenze(req.utente, barbiere_id)) return vietato(res);
 
-    try {
-        // Usa ora italiana — CURRENT_DATE/CURRENT_TIME sul server UTC darebbe orari sbagliati
-        const italianNow = new Date().toLocaleString('sv-SE', { timeZone: 'Europe/Rome' }).replace(' ', 'T');
-        const oggi = italianNow.slice(0, 10);
-        const italianTime = italianNow.slice(11, 16);
-        const inizio = data_inizio || oggi;
-
-        // Calcola data fine (se specificati i giorni)
-        let fine = null;
-        if (giorni && giorni > 0) {
-            const d = new Date(inizio + 'T12:00:00Z');
-            d.setDate(d.getDate() + giorni - 1);
-            fine = d.toISOString().split('T')[0];
-        }
-
-        const isOggi = inizio <= oggi;
-        const infoObj = {
-            tipo: 'assente',
-            stato: isOggi ? 'attivo' : 'programmato',
-            inizio,
-            fine,
-            motivo: motivo || 'Assente'
-        };
-
-        if (isOggi) {
-            // Attivazione immediata
-            await pool.query(
-                'UPDATE barbieri SET assente = true, motivo_assenza = $1 WHERE id = $2',
-                [JSON.stringify(infoObj), barbiere_id]
-            );
-
-            // Trova appuntamenti da cancellare nel periodo (usa data/ora italiana come parametri)
-            const appParams = [barbiere_id, oggi, italianTime];
-            let appQuery = `SELECT p.id, p.cliente_uuid, p.data, p.ora, b.nome AS barbiere_nome, sv.nome AS servizio_nome
-                 FROM prenotazioni p
-                 JOIN barbieri b ON p.barbiere_id = b.id
-                 JOIN servizi sv ON p.servizio_id = sv.id
-                 WHERE p.barbiere_id = $1 AND p.stato = 'attivo'
-                 AND (p.data > $2::date OR (p.data = $2::date AND p.ora >= $3::time))`;
-            if (fine) { appQuery += ` AND p.data <= $4::date`; appParams.push(fine); }
-            const appuntamenti = await pool.query(appQuery, appParams);
-
-            // Notifica clienti registrati
-            let notificheInviate = 0;
-            for (const app of appuntamenti.rows) {
-                if (app.cliente_uuid) {
-                    const dateObj = new Date(app.data);
-                    const giorniNomi = ['Domenica','Lunedì','Martedì','Mercoledì','Giovedì','Venerdì','Sabato'];
-                    const mesi = ['Gennaio','Febbraio','Marzo','Aprile','Maggio','Giugno','Luglio','Agosto','Settembre','Ottobre','Novembre','Dicembre'];
-                    const dataFormattata = `${giorniNomi[dateObj.getDay()]} ${dateObj.getDate()} ${mesi[dateObj.getMonth()]}`;
-                    const messaggio = `Ci scusiamo per il disagio. Il tuo appuntamento di **${dataFormattata}** alle **${app.ora.slice(0,5)}** con **${app.barbiere_nome}** per il servizio di **${app.servizio_nome}** è stato cancellato perché il barbiere non è disponibile.\n\nTi invitiamo a prenotare un nuovo appuntamento.`;
-                    await pool.query('INSERT INTO notifiche (cliente_uuid, messaggio) VALUES ($1, $2)', [app.cliente_uuid, messaggio]);
-                    notificheInviate++;
-                }
-            }
-
-            // Marca cancellato (non elimina) — così è ripristinabile alla riattivazione
-            const delParams = [barbiere_id, oggi, italianTime];
-            let delQuery = `UPDATE prenotazioni SET stato = 'cancellato'
-                 WHERE barbiere_id = $1 AND stato = 'attivo'
-                 AND (data > $2::date OR (data = $2::date AND ora >= $3::time))`;
-            if (fine) { delQuery += ` AND data <= $4::date`; delParams.push(fine); }
-            const eliminati = await pool.query(delQuery, delParams);
-
-            res.json({
-                success: true,
-                eliminati: eliminati.rowCount,
-                notifiche_inviate: notificheInviate,
-                messaggio: `Barbiere segnato come assente. ${eliminati.rowCount} appuntamenti cancellati e ${notificheInviate} clienti notificati.`
-            });
-        } else {
-            // Programmazione futura: non imposta assente=true, solo salva il piano
-            await pool.query(
-                'UPDATE barbieri SET assente = false, motivo_assenza = $1 WHERE id = $2',
-                [JSON.stringify(infoObj), barbiere_id]
-            );
-            const dataFmt = new Date(inizio + 'T12:00:00Z').toLocaleDateString('it-IT', { day: 'numeric', month: 'long' });
-            res.json({ success: true, messaggio: `Assenza programmata per il ${dataFmt}.` });
-        }
-    } catch (err) {
-        console.error("Errore assenza:", err.message, err.stack);
-        res.status(500).json({ error: "Errore nella gestione dell'assenza: " + err.message });
+    const inizio = data_inizio || oraItalia().data;
+    if (!DATA_RE.test(inizio)) return res.status(400).json({ error: "Data non valida" });
+    let fine = null;
+    if (giorni && giorni > 0) {
+        const d = new Date(inizio + 'T12:00:00Z');
+        d.setUTCDate(d.getUTCDate() + Number(giorni) - 1);
+        fine = d.toISOString().slice(0, 10);
     }
+    return registraAssenza(res, { barbiere_id: Number(barbiere_id), tipo: 'assente', data_inizio: inizio, data_fine: fine }, motivo || 'Assente');
 });
 
-// PERMESSO TEMPORANEO BARBIERE (con data, ora e durata in minuti)
+// PERMESSO (fascia oraria in un giorno: data, ora di inizio e durata in minuti)
 app.post('/api/admin/barbiere-permesso', verificaToken, soloAdmin, async (req, res) => {
-    const { barbiere_id, data_inizio, ora_inizio, minuti } = req.body;
-    if (!barbiere_id || !minuti) return res.status(400).json({ error: "Manca barbiere_id o minuti" });
+    const { barbiere_id, data_inizio, ora_inizio, minuti: durata } = req.body;
+    if (!barbiere_id || !durata) return res.status(400).json({ error: "Manca barbiere_id o minuti" });
     if (!puoGestireAssenze(req.utente, barbiere_id)) return vietato(res);
+
+    const adesso = oraItalia();
+    const dataI = data_inizio || adesso.data;
+    const oraI = ora_inizio || adesso.ora;
+    if (!DATA_RE.test(dataI) || !ORA_RE.test(oraI)) return res.status(400).json({ error: "Data o ora non valida" });
+    const durataMin = parseInt(durata, 10);
+    const fineMin = minuti(oraI) + durataMin;
+    if (!(durataMin > 0)) return res.status(400).json({ error: "Durata non valida" });
+    if (fineMin > 24 * 60) return res.status(400).json({ error: "Il permesso deve terminare entro la mezzanotte" });
+
+    return registraAssenza(res, {
+        barbiere_id: Number(barbiere_id), tipo: 'permesso',
+        data_inizio: dataI, data_fine: dataI, ora_inizio: oraI, ora_fine: hhmm(fineMin),
+    });
+});
+
+// ANNULLA una singola assenza/permesso (ripristina gli appuntamenti che aveva cancellato)
+app.delete('/api/admin/assenze/:id', verificaToken, soloAdmin, async (req, res) => {
+    if (!/^\d+$/.test(req.params.id)) return res.status(404).json({ error: "Non trovata" });
+    const client = await pool.connect();
     try {
-        // Ora italiana corrente — evita shift UTC (server è UTC, Italia è UTC+2)
-        const italianNow = new Date().toLocaleString('sv-SE', { timeZone: 'Europe/Rome' }).replace(' ', 'T');
-        const oggi = italianNow.split('T')[0];
-        const dataI = data_inizio || oggi;
-        const oraI = ora_inizio || italianNow.slice(11, 16);
-
-        // Calcolo aritmetico per oraFine — nessuna conversione Date che causa shift UTC
-        const [hI, mI] = oraI.split(':').map(Number);
-        const totalMin = hI * 60 + mI + parseInt(minuti);
-        const endH = Math.floor(totalMin / 60) % 24;
-        const endM = totalMin % 60;
-        const oraFineStr = `${String(endH).padStart(2,'0')}:${String(endM).padStart(2,'0')}`;
-
-        // Confronto su stringa italiana — no Date UTC
-        const isOra = `${dataI}T${oraI}:00` <= italianNow;
-
-        // Salva come stringhe locali senza 'Z' — il browser italiano le legge correttamente
-        const infoObj = {
-            tipo: 'permesso',
-            stato: isOra ? 'attivo' : 'programmato',
-            inizio: `${dataI}T${oraI}:00`,
-            fine: `${dataI}T${oraFineStr}:00`
-        };
-
-        await pool.query(
-            'UPDATE barbieri SET assente = $1, motivo_assenza = $2 WHERE id = $3',
-            [isOra, JSON.stringify(infoObj), barbiere_id]
-        );
-
-        // Cerca appuntamenti da cancellare per inviare notifiche prima di aggiornare
-        const appsPermesso = await pool.query(
-            `SELECT p.id, p.cliente_uuid, p.data, p.ora, bv.nome AS barbiere_nome, sv.nome AS servizio_nome
-             FROM prenotazioni p
-             JOIN barbieri bv ON p.barbiere_id = bv.id
-             JOIN servizi sv ON p.servizio_id = sv.id
-             WHERE p.barbiere_id = $1 AND p.data = $2 AND p.stato = 'attivo'
-             AND p.ora >= $3 AND p.ora < $4`,
-            [barbiere_id, dataI, oraI, oraFineStr]
-        );
-
-        for (const app of appsPermesso.rows) {
-            if (app.cliente_uuid) {
-                const dateObj = new Date(app.data);
-                const giorniNomi = ['Domenica','Lunedì','Martedì','Mercoledì','Giovedì','Venerdì','Sabato'];
-                const mesi = ['Gennaio','Febbraio','Marzo','Aprile','Maggio','Giugno','Luglio','Agosto','Settembre','Ottobre','Novembre','Dicembre'];
-                const dataFormattata = `${giorniNomi[dateObj.getDay()]} ${dateObj.getDate()} ${mesi[dateObj.getMonth()]}`;
-                const messaggio = `Ci scusiamo per il disagio. Il tuo appuntamento di **${dataFormattata}** alle **${app.ora.slice(0,5)}** con **${app.barbiere_nome}** per il servizio di **${app.servizio_nome}** è stato cancellato perché il barbiere è in permesso.\n\nTi invitiamo a prenotare un nuovo appuntamento.`;
-                await pool.query('INSERT INTO notifiche (cliente_uuid, messaggio) VALUES ($1, $2)', [app.cliente_uuid, messaggio]);
-            }
+        await client.query('BEGIN');
+        const r = await client.query(`SELECT ${COLONNE_ASSENZA} FROM assenze WHERE id = $1 FOR UPDATE`, [req.params.id]);
+        if (r.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: "Non trovata" });
         }
-
-        await pool.query(
-            `UPDATE prenotazioni SET stato = 'cancellato'
-             WHERE barbiere_id = $1 AND data = $2 AND stato = 'attivo'
-             AND ora >= $3 AND ora < $4`,
-            [barbiere_id, dataI, oraI, oraFineStr]
-        );
-
-        const ore = Math.floor(minuti / 60);
-        const min = minuti % 60;
-        const durata = ore > 0 ? `${ore}h${min > 0 ? ` ${min}min` : ''}` : `${min}min`;
-
-        if (isOra) {
-            res.json({ success: true, messaggio: `Barbiere in permesso per ${durata}` });
-        } else {
-            const dataFmt = new Date(dataI + 'T12:00:00').toLocaleDateString('it-IT', { day: 'numeric', month: 'long' });
-            res.json({ success: true, messaggio: `Permesso programmato per il ${dataFmt} alle ${oraI} (${durata})` });
+        const a = r.rows[0];
+        if (!puoGestireAssenze(req.utente, a.barbiere_id)) {
+            await client.query('ROLLBACK');
+            return vietato(res);
         }
+        const ripristinati = await annullaAssenza(client, a);
+        await client.query('COMMIT');
+        res.json({
+            success: true,
+            ripristinati,
+            messaggio: `${a.tipo === 'permesso' ? 'Permesso annullato' : 'Assenza annullata'}. ${ripristinati} appuntamenti ripristinati.`,
+        });
     } catch (err) {
-        console.error("Errore permesso:", err.message, err.stack);
-        res.status(500).json({ error: "Errore nella gestione del permesso: " + err.message });
+        await client.query('ROLLBACK');
+        console.error("Errore annullamento assenza:", err.message);
+        res.status(500).json({ error: "Errore" });
+    } finally {
+        client.release();
     }
 });
 
-// RIATTIVA BARBIERE
+// RIATTIVA BARBIERE: annulla le assenze/permessi in corso oggi (compatibilità con la vecchia dashboard)
 app.post('/api/admin/barbiere-presente', verificaToken, soloAdmin, async (req, res) => {
     const { barbiere_id } = req.body;
     if (!barbiere_id) return res.status(400).json({ error: "Manca barbiere_id" });
     if (!puoGestireAssenze(req.utente, barbiere_id)) return vietato(res);
+    const client = await pool.connect();
     try {
-        const italianNow = new Date().toLocaleString('sv-SE', { timeZone: 'Europe/Rome' }).replace(' ', 'T');
-        const italianDate = italianNow.slice(0, 10);
-        const italianTime = italianNow.slice(11, 16);
-
-        // Trova appuntamenti cancellati futuri da ripristinare (usa ora italiana)
-        const daRipristinare = await pool.query(
-            `SELECT p.id, p.cliente_uuid, p.data, p.ora, b.nome AS barbiere_nome, sv.nome AS servizio_nome
-             FROM prenotazioni p
-             JOIN barbieri b ON p.barbiere_id = b.id
-             JOIN servizi sv ON p.servizio_id = sv.id
-             WHERE p.barbiere_id = $1 AND p.stato = 'cancellato'
-             AND (p.data > $2::date OR (p.data = $2::date AND p.ora >= $3::time))`,
-            [barbiere_id, italianDate, italianTime]
+        await client.query('BEGIN');
+        const r = await client.query(
+            `SELECT ${COLONNE_ASSENZA} FROM assenze
+             WHERE barbiere_id = $1 AND data_inizio <= $2::date AND COALESCE(data_fine, 'infinity') >= $2::date
+             FOR UPDATE`,
+            [barbiere_id, oraItalia().data]
         );
-
-        if (daRipristinare.rows.length > 0) {
-            // Ripristina gli appuntamenti a 'attivo'
-            await pool.query(
-                `UPDATE prenotazioni SET stato = 'attivo'
-                 WHERE barbiere_id = $1 AND stato = 'cancellato'
-                 AND (data > $2::date OR (data = $2::date AND ora >= $3::time))`,
-                [barbiere_id, italianDate, italianTime]
-            );
-
-            // Notifica ogni cliente del ripristino
-            for (const app of daRipristinare.rows) {
-                if (app.cliente_uuid) {
-                    const dateObj = new Date(app.data);
-                    const giorniNomi = ['Domenica','Lunedì','Martedì','Mercoledì','Giovedì','Venerdì','Sabato'];
-                    const mesi = ['Gennaio','Febbraio','Marzo','Aprile','Maggio','Giugno','Luglio','Agosto','Settembre','Ottobre','Novembre','Dicembre'];
-                    const dataFormattata = `${giorniNomi[dateObj.getDay()]} ${dateObj.getDate()} ${mesi[dateObj.getMonth()]}`;
-                    const messaggio = `Buone notizie! Il tuo appuntamento di **${dataFormattata}** alle **${app.ora.slice(0,5)}** con **${app.barbiere_nome}** per il servizio di **${app.servizio_nome}** è stato ripristinato. Il barbiere è nuovamente disponibile.\n\nTi aspettiamo!`;
-                    await pool.query('INSERT INTO notifiche (cliente_uuid, messaggio) VALUES ($1, $2)', [app.cliente_uuid, messaggio]);
-                }
-            }
-        }
-
-        // Riattiva il barbiere
-        await pool.query('UPDATE barbieri SET assente = false, motivo_assenza = NULL WHERE id = $1', [barbiere_id]);
-
-        res.json({
-            success: true,
-            messaggio: `Barbiere riattivato. ${daRipristinare.rows.length} appuntamenti ripristinati.`,
-            ripristinati: daRipristinare.rows.length
-        });
+        let ripristinati = 0;
+        for (const a of r.rows) ripristinati += await annullaAssenza(client, a);
+        await client.query('COMMIT');
+        res.json({ success: true, messaggio: `Barbiere riattivato. ${ripristinati} appuntamenti ripristinati.`, ripristinati });
     } catch (err) {
+        await client.query('ROLLBACK');
         res.status(500).json({ error: "Errore" });
+    } finally {
+        client.release();
     }
 });
