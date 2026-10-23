@@ -10,6 +10,10 @@ app.set('trust proxy', 1); // Render sta dietro un proxy: serve per leggere l'IP
 app.use(cors());
 app.use(express.json({ limit: '10kb' }));
 
+// Keep-alive: un cron esterno (es. cron-job.org ogni 10 minuti) chiama questa rotta per evitare che
+// Render addormenti il servizio (cold start ~30 s). Non tocca il database ed è fuori dal rate limit.
+app.get('/api/ping', (req, res) => res.json({ ok: true, ts: Date.now() }));
+
 // Rate limiting per IP: generale su tutte le API + più stretto sulle scritture
 app.use('/api', rateLimit({ windowMs: 60 * 1000, limit: 120, standardHeaders: 'draft-7', legacyHeaders: false }));
 const limiteScritture = rateLimit({
@@ -76,6 +80,10 @@ setInterval(() => {
     }
 }, 60 * 1000); // pulizia ogni minuto
 
+// Verifiche in corso per token: le pagine fanno più chiamate in parallelo con lo stesso token
+// appena emesso; così Supabase Auth + DB vengono interrogati una volta sola, non una per chiamata.
+const verificheInCorso = new Map(); // token → Promise<utente | null>
+
 const verificaToken = async (req, res, next) => {
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -92,68 +100,76 @@ const verificaToken = async (req, res, next) => {
             return next();
         }
 
-        const risposta = await fetch(`${process.env.SUPABASE_URL}/auth/v1/user`, {
-            headers: {
-                'Authorization': `Bearer ${token}`,
-                'apikey': process.env.SUPABASE_ANON_KEY,
-            }
-        });
-
-        if (!risposta.ok) {
-            return res.status(401).json({ error: "Token non valido o scaduto" });
+        let verifica = verificheInCorso.get(token);
+        if (!verifica) {
+            verifica = utenteDaToken(token).finally(() => verificheInCorso.delete(token));
+            verificheInCorso.set(token, verifica);
         }
-
-        const userData = await risposta.json();
-        const uuid = userData.id;
-
-        const result = await pool.query(
-            `SELECT p.id, p.ruolo, p.nome, p.cognome, p.telefono, b.id AS barbiere_id
-             FROM profili p
-             LEFT JOIN barbieri b ON b.profilo_id = p.id
-             WHERE p.id = $1`,
-            [uuid]
-        );
-
-        if (result.rows.length === 0) {
-            return res.status(401).json({ error: "Utente non trovato" });
-        }
-
-        const u = result.rows[0];
-
-        const telefonoMeta = userData.user_metadata?.telefono || null;
-        const telefono = u.telefono || telefonoMeta;
-        if (!u.telefono && telefono) {
-            pool.query('UPDATE profili SET telefono = $1 WHERE id = $2', [telefono, uuid]).catch(() => {});
-        }
-
-        // Se profili non ha nome ma user_metadata sì, sincronizza (cliente appena registrato)
-        let nome = u.nome;
-        let cognome = u.cognome;
-        if (!nome && userData.user_metadata?.nome) {
-            nome = userData.user_metadata.nome;
-            cognome = userData.user_metadata.cognome || null;
-            pool.query('UPDATE profili SET nome=$1, cognome=$2 WHERE id=$3', [nome, cognome, uuid]).catch(() => {});
-        }
-
-        const utente = {
-            id: uuid,
-            uuid,
-            email: userData.email,
-            barbiere_id: u.barbiere_id,
-            nome,
-            cognome,
-            telefono,
-            ruolo: u.ruolo,
-        };
-
-        // Salva in cache per 5 minuti (il token Supabase dura 1 ora, quindi è sicuro)
-        tokenCache.set(token, { utente, scadenza: Date.now() + 5 * 60 * 1000 });
+        const utente = await verifica;
+        if (!utente) return res.status(401).json({ error: "Token non valido o scaduto" });
 
         req.utente = utente;
         next();
     } catch (err) {
         return res.status(401).json({ error: "Token non valido o scaduto" });
     }
+};
+
+// Utente del token (null se il token non è valido o il profilo non esiste); salva in cache 5 minuti
+const utenteDaToken = async (token) => {
+    const risposta = await fetch(`${process.env.SUPABASE_URL}/auth/v1/user`, {
+        headers: {
+            'Authorization': `Bearer ${token}`,
+            'apikey': process.env.SUPABASE_ANON_KEY,
+        }
+    });
+
+    if (!risposta.ok) return null;
+
+    const userData = await risposta.json();
+    const uuid = userData.id;
+
+    const result = await pool.query(
+        `SELECT p.id, p.ruolo, p.nome, p.cognome, p.telefono, b.id AS barbiere_id
+         FROM profili p
+         LEFT JOIN barbieri b ON b.profilo_id = p.id
+         WHERE p.id = $1`,
+        [uuid]
+    );
+
+    if (result.rows.length === 0) return null;
+
+    const u = result.rows[0];
+
+    const telefonoMeta = userData.user_metadata?.telefono || null;
+    const telefono = u.telefono || telefonoMeta;
+    if (!u.telefono && telefono) {
+        pool.query('UPDATE profili SET telefono = $1 WHERE id = $2', [telefono, uuid]).catch(() => {});
+    }
+
+    // Se profili non ha nome ma user_metadata sì, sincronizza (cliente appena registrato)
+    let nome = u.nome;
+    let cognome = u.cognome;
+    if (!nome && userData.user_metadata?.nome) {
+        nome = userData.user_metadata.nome;
+        cognome = userData.user_metadata.cognome || null;
+        pool.query('UPDATE profili SET nome=$1, cognome=$2 WHERE id=$3', [nome, cognome, uuid]).catch(() => {});
+    }
+
+    const utente = {
+        id: uuid,
+        uuid,
+        email: userData.email,
+        barbiere_id: u.barbiere_id,
+        nome,
+        cognome,
+        telefono,
+        ruolo: u.ruolo,
+    };
+
+    // Salva in cache per 5 minuti (il token Supabase dura 1 ora, quindi è sicuro)
+    tokenCache.set(token, { utente, scadenza: Date.now() + 5 * 60 * 1000 });
+    return utente;
 };
 
 const soloAdmin = (req, res, next) => {
