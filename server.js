@@ -496,10 +496,15 @@ app.get('/api/servizi', async (req, res) => {
 app.get('/api/barbieri/:sede_id', async (req, res) => {
     const { sede_id } = req.params;
     try {
+        // giorni_lavoro: giorni della settimana (0=dom … 6=sab) in cui il barbiere è in QUESTA sede
         const result = await pool.query(
-            `SELECT DISTINCT b.id, b.nome FROM barbieri b
+            `SELECT b.id, b.nome,
+                    array_agg(DISTINCT t.giorno_settimana ORDER BY t.giorno_settimana) AS giorni_lavoro
+             FROM barbieri b
              JOIN turni_rotazione t ON b.id = t.barbiere_id
-             WHERE t.sede_id = $1`,
+             WHERE t.sede_id = $1
+             GROUP BY b.id, b.nome
+             ORDER BY b.id`,
             [sede_id]
         );
         res.json(result.rows);
