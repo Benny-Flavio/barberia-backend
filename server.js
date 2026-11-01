@@ -4,6 +4,7 @@ const { Pool } = require('pg');
 require('dotenv').config();
 const cron = require('node-cron');
 const rateLimit = require('express-rate-limit');
+const { emailConfigurata, inviaEmail } = require('./email');
 
 const app = express();
 app.set('trust proxy', 1); // Render sta dietro un proxy: serve per leggere l'IP reale del client
@@ -23,6 +24,7 @@ const limiteScritture = rateLimit({
 });
 app.use('/api/prenotazioni', limiteScritture);
 app.use('/api/auth', limiteScritture);
+app.use('/api/admin/comunicazioni', limiteScritture);
 
 // ==========================================
 // CONFIGURAZIONE DATABASE
@@ -278,8 +280,61 @@ const trovaSovrapposizione = async (db, nuova) => {
     ) || null;
 };
 
+// ==========================================
+// MESSAGGI AI CLIENTI (inbox in-app + email)
+// ==========================================
+// Ogni messaggio è una riga di notifiche (visibile in "Messaggi") e, se l'email è configurata,
+// viene inviato anche all'indirizzo di login del cliente (auth.users.email).
+const OGGETTO_EMAIL = {
+    cancellazione: 'Il tuo appuntamento è stato cancellato',
+    ripristino: 'Il tuo appuntamento è stato ripristinato',
+};
+const pausa = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Inserisce un messaggio nell'inbox del cliente e ne restituisce l'id
+const creaNotifica = async (db, { cliente_uuid, tipo, titolo, messaggio, comunicazione_id = null }) => {
+    const r = await db.query(
+        `INSERT INTO notifiche (cliente_uuid, tipo, titolo, messaggio, comunicazione_id)
+         VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+        [cliente_uuid, tipo, titolo, messaggio, comunicazione_id]
+    );
+    return r.rows[0].id;
+};
+
+// Invia per email i messaggi indicati, uno alla volta, registrando l'esito su ogni riga.
+// Va chiamata DOPO il COMMIT (un'operazione annullata non deve mandare email).
+const inviaEmailNotifiche = async (ids) => {
+    if (!ids.length) return;
+    if (!emailConfigurata()) {
+        console.log(`Email non configurata (RESEND_API_KEY / EMAIL_MITTENTE): ${ids.length} messaggi solo in-app`);
+        return;
+    }
+    const r = await pool.query(
+        `SELECT n.id, n.tipo, n.titolo, n.messaggio, u.email
+         FROM notifiche n JOIN auth.users u ON u.id = n.cliente_uuid
+         WHERE n.id = ANY($1::int[]) AND n.email_inviata_at IS NULL AND u.email IS NOT NULL`,
+        [ids]
+    );
+    for (const n of r.rows) {
+        const titolo = n.titolo || 'Nuovo messaggio';
+        try {
+            await inviaEmail({ a: n.email, oggetto: OGGETTO_EMAIL[n.tipo] || titolo, titolo, messaggio: n.messaggio });
+            await pool.query('UPDATE notifiche SET email_inviata_at = now(), email_errore = NULL WHERE id = $1', [n.id]);
+        } catch (err) {
+            console.error(`Email notifica ${n.id} non inviata:`, err.message);
+            await pool.query('UPDATE notifiche SET email_errore = $2 WHERE id = $1', [n.id, String(err.message).slice(0, 300)]).catch(() => {});
+        }
+        await pausa(600); // Resend accetta al massimo ~2 richieste al secondo
+    }
+};
+// In background: la risposta all'app non aspetta l'invio delle email
+const programmaEmail = (ids) => {
+    inviaEmailNotifiche(ids).catch((err) => console.error('Invio email notifiche:', err.message));
+};
+
 // Cancella (stato 'cancellato', non elimina) gli appuntamenti futuri che cadono nell'assenza/permesso
 // e avvisa i clienti. Restano collegati all'assenza per ripristinarli se viene annullata.
+// Restituisce anche gli id dei messaggi creati, da inviare per email dopo il COMMIT.
 const cancellaPerAssenza = async (db, a) => {
     const { data: oggi, ora } = oraItalia();
     const params = [a.barbiere_id, oggi, ora, a.data_inizio];
@@ -303,20 +358,20 @@ const cancellaPerAssenza = async (db, a) => {
         params
     );
     const perche = a.tipo === 'permesso' ? 'il barbiere è in permesso' : 'il barbiere non è disponibile';
-    let notificati = 0;
+    const notifiche = [];
     for (const app of r.rows) {
         await db.query("UPDATE prenotazioni SET stato = 'cancellato', cancellata_da_assenza = $2 WHERE id = $1", [app.id, a.id]);
         if (app.cliente_uuid) {
             const messaggio = `Ci scusiamo per il disagio. Il tuo appuntamento di **${fmtData(app.data)}** alle **${String(app.ora).slice(0, 5)}** con **${app.barbiere_nome}** per il servizio di **${app.servizio_nome}** è stato cancellato perché ${perche}.\n\nTi invitiamo a prenotare un nuovo appuntamento.`;
-            await db.query('INSERT INTO notifiche (cliente_uuid, messaggio) VALUES ($1, $2)', [app.cliente_uuid, messaggio]);
-            notificati++;
+            notifiche.push(await creaNotifica(db, { cliente_uuid: app.cliente_uuid, tipo: 'cancellazione', titolo: 'Appuntamento cancellato', messaggio }));
         }
     }
-    return { cancellati: r.rows.length, notificati };
+    return { cancellati: r.rows.length, notificati: notifiche.length, notifiche };
 };
 
 // Annulla un'assenza/permesso: ripristina gli appuntamenti futuri che aveva cancellato
 // (se lo slot è ancora libero), avvisa i clienti ed elimina il record.
+// Restituisce quanti appuntamenti sono stati ripristinati e gli id dei messaggi creati.
 const annullaAssenza = async (db, a) => {
     const { data: oggi, ora } = oraItalia();
     const r = await db.query(
@@ -329,6 +384,7 @@ const annullaAssenza = async (db, a) => {
         [a.id, oggi, ora]
     );
     let ripristinati = 0;
+    const notifiche = [];
     for (const app of r.rows) {
         const u = await db.query(
             `UPDATE prenotazioni p SET stato = 'attivo', cancellata_da_assenza = NULL
@@ -341,11 +397,11 @@ const annullaAssenza = async (db, a) => {
         ripristinati++;
         if (app.cliente_uuid) {
             const messaggio = `Buone notizie! Il tuo appuntamento di **${fmtData(app.data)}** alle **${String(app.ora).slice(0, 5)}** con **${app.barbiere_nome}** per il servizio di **${app.servizio_nome}** è stato ripristinato. Il barbiere è nuovamente disponibile.\n\nTi aspettiamo!`;
-            await db.query('INSERT INTO notifiche (cliente_uuid, messaggio) VALUES ($1, $2)', [app.cliente_uuid, messaggio]);
+            notifiche.push(await creaNotifica(db, { cliente_uuid: app.cliente_uuid, tipo: 'ripristino', titolo: 'Appuntamento ripristinato', messaggio }));
         }
     }
     await db.query('DELETE FROM assenze WHERE id = $1', [a.id]);
-    return ripristinati;
+    return { ripristinati, notifiche };
 };
 
 // ==========================================
@@ -732,7 +788,9 @@ app.delete('/api/prenotazioni/:id', verificaToken, async (req, res) => {
 app.get('/api/notifiche', verificaToken, async (req, res) => {
     try {
         const result = await pool.query(
-            'SELECT * FROM notifiche WHERE cliente_uuid = $1 ORDER BY created_at DESC LIMIT 20',
+            // Solo i campi per l'app (l'esito delle email resta interno)
+            `SELECT id, tipo, titolo, messaggio, letta, created_at
+             FROM notifiche WHERE cliente_uuid = $1 ORDER BY created_at DESC LIMIT 20`,
             [req.utente.uuid]
         );
         res.json(result.rows);
@@ -950,8 +1008,9 @@ const registraAssenza = async (res, nuova, motivo) => {
             [nuova.barbiere_id, nuova.tipo, nuova.data_inizio, nuova.data_fine, nuova.ora_inizio || null, nuova.ora_fine || null, motivo || null]
         );
         const assenza = ins.rows[0];
-        const { cancellati, notificati } = await cancellaPerAssenza(client, assenza);
+        const { cancellati, notificati, notifiche } = await cancellaPerAssenza(client, assenza);
         await client.query('COMMIT');
+        programmaEmail(notifiche);
         const cosa = assenza.tipo === 'permesso' ? 'Permesso registrato' : 'Assenza registrata';
         res.json({
             success: true,
@@ -1028,8 +1087,9 @@ app.delete('/api/admin/assenze/:id', verificaToken, soloAdmin, async (req, res) 
             await client.query('ROLLBACK');
             return vietato(res);
         }
-        const ripristinati = await annullaAssenza(client, a);
+        const { ripristinati, notifiche } = await annullaAssenza(client, a);
         await client.query('COMMIT');
+        programmaEmail(notifiche);
         res.json({
             success: true,
             ripristinati,
@@ -1059,13 +1119,104 @@ app.post('/api/admin/barbiere-presente', verificaToken, soloAdmin, async (req, r
             [barbiere_id, oraItalia().data]
         );
         let ripristinati = 0;
-        for (const a of r.rows) ripristinati += await annullaAssenza(client, a);
+        const notifiche = [];
+        for (const a of r.rows) {
+            const esito = await annullaAssenza(client, a);
+            ripristinati += esito.ripristinati;
+            notifiche.push(...esito.notifiche);
+        }
         await client.query('COMMIT');
+        programmaEmail(notifiche);
         res.json({ success: true, messaggio: `Barbiere riattivato. ${ripristinati} appuntamenti ripristinati.`, ripristinati });
     } catch (err) {
         await client.query('ROLLBACK');
         res.status(500).json({ error: "Errore" });
     } finally {
         client.release();
+    }
+});
+
+// ==========================================
+// COMUNICAZIONI GENERALI DELLO STAFF (es. "Sede chiusa per problemi tecnici")
+// ==========================================
+// Il messaggio arriva nella sezione Messaggi di ogni destinatario (una riga di notifiche ciascuno,
+// con il proprio stato "letto") e, se configurata, via email. Destinatari:
+//   cliente_uuid → solo quel cliente
+//   sede_id      → i clienti che hanno prenotato almeno una volta in quella sede
+//   nessuno dei due → tutti i clienti
+// Con anteprima: true non invia nulla e restituisce solo il numero di destinatari.
+const DESTINATARI_SQL = `
+    SELECT p.id FROM profili p
+    WHERE p.ruolo = 'cliente'
+      AND ($1::uuid IS NULL OR p.id = $1::uuid)
+      AND ($2::int IS NULL OR EXISTS (
+            SELECT 1 FROM prenotazioni pr WHERE pr.cliente_uuid = p.id AND pr.sede_id = $2::int))`;
+
+app.post('/api/admin/comunicazioni', verificaToken, soloAdmin, async (req, res) => {
+    const titolo = String(req.body.titolo ?? '').trim();
+    const messaggio = String(req.body.messaggio ?? '').trim();
+    const sedeId = req.body.sede_id == null || req.body.sede_id === '' ? null : Number(req.body.sede_id);
+    const clienteUuid = req.body.cliente_uuid || null;
+    if (!titolo || titolo.length > 120) return res.status(400).json({ error: "Il titolo è obbligatorio (max 120 caratteri)" });
+    if (!messaggio || messaggio.length > 2000) return res.status(400).json({ error: "Il messaggio è obbligatorio (max 2000 caratteri)" });
+    if (sedeId !== null && !Number.isInteger(sedeId)) return res.status(400).json({ error: "Sede non valida" });
+    if (clienteUuid && !/^[0-9a-f-]{36}$/i.test(clienteUuid)) return res.status(400).json({ error: "Cliente non valido" });
+
+    const client = await pool.connect();
+    try {
+        if (sedeId !== null && (await client.query('SELECT 1 FROM sedi WHERE id = $1', [sedeId])).rows.length === 0) {
+            return res.status(400).json({ error: "Sede non valida" });
+        }
+        const destinatari = (await client.query(DESTINATARI_SQL, [clienteUuid, sedeId])).rows.map((r) => r.id);
+        if (req.body.anteprima) {
+            return res.json({ anteprima: true, destinatari: destinatari.length, email: emailConfigurata() });
+        }
+        if (destinatari.length === 0) return res.status(400).json({ error: "Nessun cliente destinatario" });
+
+        await client.query('BEGIN');
+        const c = await client.query(
+            `INSERT INTO comunicazioni (titolo, messaggio, sede_id, inviata_da, destinatari)
+             VALUES ($1, $2, $3, $4, $5) RETURNING id, titolo, messaggio, sede_id, destinatari, created_at`,
+            [titolo, messaggio, sedeId, req.utente.uuid, destinatari.length]
+        );
+        const comunicazione = c.rows[0];
+        // Una riga per cliente in un'unica query
+        const ins = await client.query(
+            `INSERT INTO notifiche (cliente_uuid, tipo, titolo, messaggio, comunicazione_id)
+             SELECT d, 'comunicazione', $2, $3, $4 FROM unnest($1::uuid[]) AS d RETURNING id`,
+            [destinatari, titolo, messaggio, comunicazione.id]
+        );
+        await client.query('COMMIT');
+        programmaEmail(ins.rows.map((r) => r.id));
+        res.json({
+            success: true,
+            comunicazione,
+            destinatari: destinatari.length,
+            email: emailConfigurata(),
+            messaggio: `Comunicazione inviata a ${destinatari.length} ${destinatari.length === 1 ? 'cliente' : 'clienti'}`
+                + (emailConfigurata() ? ' (anche via email).' : ' (solo in app: email non configurata).'),
+        });
+    } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error("Errore invio comunicazione:", err.message);
+        res.status(500).json({ error: "Errore nell'invio della comunicazione" });
+    } finally {
+        client.release();
+    }
+});
+
+// Storico delle comunicazioni inviate, con l'esito delle email
+app.get('/api/admin/comunicazioni', verificaToken, soloAdmin, async (req, res) => {
+    try {
+        const r = await pool.query(
+            `SELECT c.id, c.titolo, c.messaggio, c.sede_id, c.destinatari, c.created_at,
+                    count(n.email_inviata_at)::int AS email_inviate,
+                    count(n.email_errore)::int AS email_fallite
+             FROM comunicazioni c LEFT JOIN notifiche n ON n.comunicazione_id = c.id
+             GROUP BY c.id ORDER BY c.created_at DESC LIMIT 50`
+        );
+        res.json(r.rows);
+    } catch (err) {
+        res.status(500).json({ error: "Errore" });
     }
 });
