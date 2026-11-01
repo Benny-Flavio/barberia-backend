@@ -25,6 +25,7 @@ const limiteScritture = rateLimit({
 app.use('/api/prenotazioni', limiteScritture);
 app.use('/api/auth', limiteScritture);
 app.use('/api/admin/comunicazioni', limiteScritture);
+app.use('/api/admin/aperture-straordinarie', limiteScritture);
 
 // ==========================================
 // CONFIGURAZIONE DATABASE
@@ -181,6 +182,15 @@ const soloAdmin = (req, res, next) => {
     next();
 };
 
+// Funzioni riservate al titolare (super_admin): comunicazioni ai clienti e aperture straordinarie.
+// I barbieri (admin) ricevono 403 anche chiamando l'API direttamente.
+const soloTitolare = (req, res, next) => {
+    if (req.utente.ruolo !== 'super_admin') {
+        return res.status(403).json({ error: "Funzione riservata al titolare" });
+    }
+    next();
+};
+
 // Staff di fiducia: ogni admin gestisce le prenotazioni di tutti i barbieri.
 // Assenze e permessi (che cancellano appuntamenti e notificano i clienti) restano
 // limitati al proprio barbiere; solo il titolare (super_admin) li gestisce per tutti.
@@ -215,6 +225,35 @@ const fmtData = (d) => {
     const [y, m, g] = dataStr(d).split('-').map(Number);
     const x = new Date(y, m - 1, g);
     return `${GIORNI[x.getDay()]} ${x.getDate()} ${MESI[x.getMonth()]}`;
+};
+
+// ==========================================
+// GIORNI DI CHIUSURA E APERTURE STRAORDINARIE
+// ==========================================
+// Domenica e lunedì il negozio è chiuso, tranne le singole date sbloccate dal titolare
+// (tabella aperture_straordinarie: una riga = una data precisa per una sede, mai ricorrente).
+const DATA_RE = /^\d{4}-\d{2}-\d{2}$/;
+const ORA_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
+// Giorno della settimana (0=dom … 6=sab) di una data 'YYYY-MM-DD', indipendente dal fuso del server
+const giornoDellaSettimana = (data) => {
+    const [y, m, g] = dataStr(data).split('-').map(Number);
+    return new Date(Date.UTC(y, m - 1, g)).getUTCDay();
+};
+const giornoDiChiusura = (data) => [0, 1].includes(giornoDellaSettimana(data));
+
+const COLONNE_APERTURA = `a.id, a.data::text AS data, a.sede_id, s.nome AS sede_nome,
+    to_char(a.ora_inizio, 'HH24:MI') AS ora_inizio, to_char(a.ora_fine, 'HH24:MI') AS ora_fine, a.barbieri`;
+
+// L'apertura straordinaria di quella data (per una sede e/o che includa un barbiere), o null
+const aperturaStraordinaria = async (db, data, { sedeId = null, barbiereId = null } = {}) => {
+    const r = await db.query(
+        `SELECT ${COLONNE_APERTURA} FROM aperture_straordinarie a JOIN sedi s ON s.id = a.sede_id
+         WHERE a.data = $1::date AND ($2::int IS NULL OR a.sede_id = $2::int)
+           AND ($3::int IS NULL OR $3::int = ANY(a.barbieri))
+         ORDER BY a.sede_id LIMIT 1`,
+        [data, sedeId, barbiereId]
+    );
+    return r.rows[0] || null;
 };
 
 const COLONNE_ASSENZA = `id, barbiere_id, tipo, data_inizio::text AS data_inizio, data_fine::text AS data_fine,
@@ -573,17 +612,23 @@ app.get('/api/barbieri-disponibili', async (req, res) => {
     const { sede_id, data } = req.query;
     if (!sede_id || !data) return res.status(400).json({ error: "Mancano parametri" });
 
-    try {
-        const dateObj = new Date(data);
-        const giorno_settimana = dateObj.getDay();
-        if (giorno_settimana === 0 || giorno_settimana === 1) return res.json({ messaggio: "Il negozio è chiuso di Domenica e Lunedì", barbieri: [] });
+    if (!DATA_RE.test(data)) return res.status(400).json({ error: "Data non valida" });
 
-        const result = await pool.query(
-            `SELECT b.id, b.nome FROM barbieri b
-             JOIN turni_rotazione t ON b.id = t.barbiere_id
-             WHERE t.sede_id = $1 AND t.giorno_settimana = $2`,
-            [sede_id, giorno_settimana]
-        );
+    try {
+        let result;
+        if (giornoDiChiusura(data)) {
+            // Domenica/lunedì: prenotabile solo se QUESTA data è un'apertura straordinaria della sede
+            const apertura = await aperturaStraordinaria(pool, data, { sedeId: Number(sede_id) });
+            if (!apertura) return res.json({ messaggio: "Il negozio è chiuso di Domenica e Lunedì", barbieri: [] });
+            result = await pool.query('SELECT id, nome FROM barbieri WHERE id = ANY($1::int[]) ORDER BY id', [apertura.barbieri]);
+        } else {
+            result = await pool.query(
+                `SELECT b.id, b.nome FROM barbieri b
+                 JOIN turni_rotazione t ON b.id = t.barbiere_id
+                 WHERE t.sede_id = $1 AND t.giorno_settimana = $2`,
+                [sede_id, giornoDellaSettimana(data)]
+            );
+        }
         // Disabilitato = assente per l'intera giornata richiesta. I permessi bloccano solo
         // le loro fasce orarie, escluse da /api/orari-disponibili.
         const assenze = await assenzeDelGiorno(pool, result.rows.map((b) => b.id), data);
@@ -603,14 +648,20 @@ app.get('/api/barbieri-disponibili', async (req, res) => {
 app.get('/api/orari-disponibili', async (req, res) => {
     const { barbiere_id, data, servizio_id } = req.query;
     if (!barbiere_id || !data) return res.status(400).json({ error: "Mancano parametri" });
+    if (!DATA_RE.test(data)) return res.status(400).json({ error: "Data non valida" });
 
     try {
-        const dateObj = new Date(data);
-        const giorno = dateObj.getDay();
-        
-        const fasce = giorno === 4
-            ? [[720, 1320]]
-            : [[540, 720], [900, 1140]];
+        let fasce;
+        if (giornoDiChiusura(data)) {
+            // Domenica/lunedì: solo la fascia dell'apertura straordinaria di questa data, se il barbiere è in servizio
+            const apertura = await aperturaStraordinaria(pool, data, { barbiereId: Number(barbiere_id) });
+            if (!apertura) return res.json([]);
+            fasce = [[minuti(apertura.ora_inizio), minuti(apertura.ora_fine)]];
+        } else {
+            fasce = giornoDellaSettimana(data) === 4
+                ? [[720, 1320]]
+                : [[540, 720], [900, 1140]];
+        }
 
         let durataServizio = 40;
         if (servizio_id) {
@@ -703,6 +754,9 @@ app.post('/api/prenotazioni', verificaToken, async (req, res) => {
     if (!sede_id || !barbiere_id || !data || !ora || !servizio_id) {
         return res.status(400).json({ error: "Mancano campi obbligatori" });
     }
+    if (!DATA_RE.test(data) || !ORA_RE.test(String(ora).slice(0, 5))) {
+        return res.status(400).json({ error: "Data o orario non validi" });
+    }
 
     const client = await pool.connect();
     try {
@@ -714,6 +768,16 @@ app.post('/api/prenotazioni', verificaToken, async (req, res) => {
         if (check.rows.length > 0) {
             await client.query('ROLLBACK');
             return res.status(409).json({ error: "Questo orario è già prenotato!" });
+        }
+        // Domenica/lunedì: solo dentro un'apertura straordinaria di QUESTA data, sede e barbiere
+        if (giornoDiChiusura(data)) {
+            const apertura = await aperturaStraordinaria(client, data, { sedeId: Number(sede_id), barbiereId: Number(barbiere_id) });
+            const durata = (await client.query('SELECT durata_minuti FROM servizi WHERE id = $1', [servizio_id])).rows[0]?.durata_minuti || 40;
+            const inizio = minuti(ora);
+            if (!apertura || inizio < minuti(apertura.ora_inizio) || inizio + durata > minuti(apertura.ora_fine)) {
+                await client.query('ROLLBACK');
+                return res.status(409).json({ error: "Il negozio è chiuso in questa data o in questo orario" });
+            }
         }
         if (!(await slotDisponibile(client, barbiere_id, data, ora, servizio_id))) {
             await client.query('ROLLBACK');
@@ -1030,9 +1094,6 @@ const registraAssenza = async (res, nuova, motivo) => {
     }
 };
 
-const DATA_RE = /^\d{4}-\d{2}-\d{2}$/;
-const ORA_RE = /^\d{2}:\d{2}$/;
-
 // ASSENZA (giornate intere, con data e durata in giorni opzionale; senza durata = senza fine)
 app.post('/api/admin/barbiere-assente', verificaToken, soloAdmin, async (req, res) => {
     const { barbiere_id, motivo, data_inizio, giorni } = req.body;
@@ -1137,14 +1198,13 @@ app.post('/api/admin/barbiere-presente', verificaToken, soloAdmin, async (req, r
 });
 
 // ==========================================
-// COMUNICAZIONI GENERALI DELLO STAFF (es. "Sede chiusa per problemi tecnici")
+// COMUNICAZIONI GENERALI (solo titolare, es. "Sede chiusa per problemi tecnici")
 // ==========================================
 // Il messaggio arriva nella sezione Messaggi di ogni destinatario (una riga di notifiche ciascuno,
 // con il proprio stato "letto") e, se configurata, via email. Destinatari:
 //   cliente_uuid → solo quel cliente
 //   sede_id      → i clienti che hanno prenotato almeno una volta in quella sede
 //   nessuno dei due → tutti i clienti
-// Con anteprima: true non invia nulla e restituisce solo il numero di destinatari.
 const DESTINATARI_SQL = `
     SELECT p.id FROM profili p
     WHERE p.ruolo = 'cliente'
@@ -1152,13 +1212,39 @@ const DESTINATARI_SQL = `
       AND ($2::int IS NULL OR EXISTS (
             SELECT 1 FROM prenotazioni pr WHERE pr.cliente_uuid = p.id AND pr.sede_id = $2::int))`;
 
-app.post('/api/admin/comunicazioni', verificaToken, soloAdmin, async (req, res) => {
+// Crea la comunicazione e un messaggio per ogni destinatario (dentro la transazione del chiamante).
+// Restituisce gli id dei messaggi: dopo il COMMIT vanno passati a programmaEmail.
+const creaComunicazione = async (db, { titolo, messaggio, sedeId = null, clienteUuid = null, inviataDa }) => {
+    const destinatari = (await db.query(DESTINATARI_SQL, [clienteUuid, sedeId])).rows.map((r) => r.id);
+    if (destinatari.length === 0) return { comunicazione: null, notifiche: [], destinatari: 0 };
+    const c = await db.query(
+        `INSERT INTO comunicazioni (titolo, messaggio, sede_id, inviata_da, destinatari)
+         VALUES ($1, $2, $3, $4, $5) RETURNING id, titolo, messaggio, sede_id, destinatari, created_at`,
+        [titolo, messaggio, sedeId, inviataDa, destinatari.length]
+    );
+    const comunicazione = c.rows[0];
+    // Una riga per cliente in un'unica query
+    const ins = await db.query(
+        `INSERT INTO notifiche (cliente_uuid, tipo, titolo, messaggio, comunicazione_id)
+         SELECT d, 'comunicazione', $2, $3, $4 FROM unnest($1::uuid[]) AS d RETURNING id`,
+        [destinatari, titolo, messaggio, comunicazione.id]
+    );
+    return { comunicazione, notifiche: ins.rows.map((r) => r.id), destinatari: destinatari.length };
+};
+
+const esitoInvio = (n) => `${n} ${n === 1 ? 'cliente' : 'clienti'}`
+    + (emailConfigurata() ? ' (in app e via email)' : ' (solo in app: email non configurata)');
+
+// Con anteprima: true non invia nulla e restituisce solo il numero di destinatari
+app.post('/api/admin/comunicazioni', verificaToken, soloTitolare, async (req, res) => {
     const titolo = String(req.body.titolo ?? '').trim();
     const messaggio = String(req.body.messaggio ?? '').trim();
     const sedeId = req.body.sede_id == null || req.body.sede_id === '' ? null : Number(req.body.sede_id);
     const clienteUuid = req.body.cliente_uuid || null;
-    if (!titolo || titolo.length > 120) return res.status(400).json({ error: "Il titolo è obbligatorio (max 120 caratteri)" });
-    if (!messaggio || messaggio.length > 2000) return res.status(400).json({ error: "Il messaggio è obbligatorio (max 2000 caratteri)" });
+    if (!req.body.anteprima) {
+        if (!titolo || titolo.length > 120) return res.status(400).json({ error: "Il titolo è obbligatorio (max 120 caratteri)" });
+        if (!messaggio || messaggio.length > 2000) return res.status(400).json({ error: "Il messaggio è obbligatorio (max 2000 caratteri)" });
+    }
     if (sedeId !== null && !Number.isInteger(sedeId)) return res.status(400).json({ error: "Sede non valida" });
     if (clienteUuid && !/^[0-9a-f-]{36}$/i.test(clienteUuid)) return res.status(400).json({ error: "Cliente non valido" });
 
@@ -1167,34 +1253,24 @@ app.post('/api/admin/comunicazioni', verificaToken, soloAdmin, async (req, res) 
         if (sedeId !== null && (await client.query('SELECT 1 FROM sedi WHERE id = $1', [sedeId])).rows.length === 0) {
             return res.status(400).json({ error: "Sede non valida" });
         }
-        const destinatari = (await client.query(DESTINATARI_SQL, [clienteUuid, sedeId])).rows.map((r) => r.id);
         if (req.body.anteprima) {
-            return res.json({ anteprima: true, destinatari: destinatari.length, email: emailConfigurata() });
+            const n = (await client.query(DESTINATARI_SQL, [clienteUuid, sedeId])).rows.length;
+            return res.json({ anteprima: true, destinatari: n, email: emailConfigurata() });
         }
-        if (destinatari.length === 0) return res.status(400).json({ error: "Nessun cliente destinatario" });
-
         await client.query('BEGIN');
-        const c = await client.query(
-            `INSERT INTO comunicazioni (titolo, messaggio, sede_id, inviata_da, destinatari)
-             VALUES ($1, $2, $3, $4, $5) RETURNING id, titolo, messaggio, sede_id, destinatari, created_at`,
-            [titolo, messaggio, sedeId, req.utente.uuid, destinatari.length]
-        );
-        const comunicazione = c.rows[0];
-        // Una riga per cliente in un'unica query
-        const ins = await client.query(
-            `INSERT INTO notifiche (cliente_uuid, tipo, titolo, messaggio, comunicazione_id)
-             SELECT d, 'comunicazione', $2, $3, $4 FROM unnest($1::uuid[]) AS d RETURNING id`,
-            [destinatari, titolo, messaggio, comunicazione.id]
-        );
+        const esito = await creaComunicazione(client, { titolo, messaggio, sedeId, clienteUuid, inviataDa: req.utente.uuid });
+        if (esito.destinatari === 0) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: "Nessun cliente destinatario" });
+        }
         await client.query('COMMIT');
-        programmaEmail(ins.rows.map((r) => r.id));
+        programmaEmail(esito.notifiche);
         res.json({
             success: true,
-            comunicazione,
-            destinatari: destinatari.length,
+            comunicazione: esito.comunicazione,
+            destinatari: esito.destinatari,
             email: emailConfigurata(),
-            messaggio: `Comunicazione inviata a ${destinatari.length} ${destinatari.length === 1 ? 'cliente' : 'clienti'}`
-                + (emailConfigurata() ? ' (anche via email).' : ' (solo in app: email non configurata).'),
+            messaggio: `Comunicazione inviata a ${esitoInvio(esito.destinatari)}.`,
         });
     } catch (err) {
         await client.query('ROLLBACK').catch(() => {});
@@ -1206,7 +1282,7 @@ app.post('/api/admin/comunicazioni', verificaToken, soloAdmin, async (req, res) 
 });
 
 // Storico delle comunicazioni inviate, con l'esito delle email
-app.get('/api/admin/comunicazioni', verificaToken, soloAdmin, async (req, res) => {
+app.get('/api/admin/comunicazioni', verificaToken, soloTitolare, async (req, res) => {
     try {
         const r = await pool.query(
             `SELECT c.id, c.titolo, c.messaggio, c.sede_id, c.destinatari, c.created_at,
@@ -1218,5 +1294,133 @@ app.get('/api/admin/comunicazioni', verificaToken, soloAdmin, async (req, res) =
         res.json(r.rows);
     } catch (err) {
         res.status(500).json({ error: "Errore" });
+    }
+});
+
+// ==========================================
+// APERTURE STRAORDINARIE (solo titolare)
+// ==========================================
+// Elenco pubblico delle aperture da oggi in poi: serve al calendario dei clienti per rendere
+// cliccabili solo quelle date (le altre domeniche e gli altri lunedì restano chiusi).
+app.get('/api/aperture-straordinarie', async (req, res) => {
+    const sedeId = req.query.sede_id ? Number(req.query.sede_id) : null;
+    if (sedeId !== null && !Number.isInteger(sedeId)) return res.status(400).json({ error: "Sede non valida" });
+    try {
+        const r = await pool.query(
+            `SELECT ${COLONNE_APERTURA} FROM aperture_straordinarie a JOIN sedi s ON s.id = a.sede_id
+             WHERE a.data >= $1::date AND ($2::int IS NULL OR a.sede_id = $2::int)
+             ORDER BY a.data, a.sede_id`,
+            [oraItalia().data, sedeId]
+        );
+        res.json(r.rows);
+    } catch (err) {
+        res.status(500).json({ error: "Errore" });
+    }
+});
+
+// Sblocca UNA data di chiusura per una sede. Con notifica_clienti: true avvisa tutti i clienti
+// (in app e via email) contestualmente allo sblocco.
+app.post('/api/admin/aperture-straordinarie', verificaToken, soloTitolare, async (req, res) => {
+    const { data, ora_inizio, ora_fine } = req.body;
+    const sedeId = Number(req.body.sede_id);
+    const barbieri = Array.isArray(req.body.barbieri) ? [...new Set(req.body.barbieri.map(Number))] : [];
+    const oggi = oraItalia().data;
+    if (!DATA_RE.test(data || '')) return res.status(400).json({ error: "Data non valida" });
+    if (!giornoDiChiusura(data)) return res.status(400).json({ error: "Le aperture straordinarie riguardano solo i giorni di chiusura (domenica e lunedì)" });
+    if (data < oggi) return res.status(400).json({ error: "La data è già passata" });
+    if (!ORA_RE.test(ora_inizio || '') || !ORA_RE.test(ora_fine || '')) return res.status(400).json({ error: "Orario non valido" });
+    if (minuti(ora_fine) - minuti(ora_inizio) < 40) return res.status(400).json({ error: "L'apertura deve durare almeno 40 minuti" });
+    if (!Number.isInteger(sedeId)) return res.status(400).json({ error: "Sede non valida" });
+    if (barbieri.length === 0 || barbieri.some((b) => !Number.isInteger(b))) return res.status(400).json({ error: "Seleziona almeno un barbiere" });
+
+    const client = await pool.connect();
+    try {
+        const sede = (await client.query('SELECT nome FROM sedi WHERE id = $1', [sedeId])).rows[0];
+        if (!sede) return res.status(400).json({ error: "Sede non valida" });
+        const esistenti = await client.query('SELECT count(*)::int AS n FROM barbieri WHERE id = ANY($1::int[])', [barbieri]);
+        if (esistenti.rows[0].n !== barbieri.length) return res.status(400).json({ error: "Barbiere non valido" });
+
+        await client.query('BEGIN');
+        const ins = await client.query(
+            `INSERT INTO aperture_straordinarie (data, sede_id, ora_inizio, ora_fine, barbieri, creata_da)
+             VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+            [data, sedeId, ora_inizio, ora_fine, barbieri, req.utente.uuid]
+        );
+        const id = ins.rows[0].id;
+        let avviso = { destinatari: 0, notifiche: [] };
+        if (req.body.notifica_clienti) {
+            avviso = await creaComunicazione(client, {
+                titolo: `Apertura straordinaria — ${fmtData(data)}`,
+                messaggio: `La sede di **${sede.nome}** sarà aperta in via straordinaria **${fmtData(data)}** dalle **${ora_inizio}** alle **${ora_fine}**.\n\nPrenota subito il tuo appuntamento dall'app: i posti sono limitati!`,
+                inviataDa: req.utente.uuid,
+            });
+            if (avviso.comunicazione) {
+                await client.query('UPDATE aperture_straordinarie SET comunicazione_id = $2 WHERE id = $1', [id, avviso.comunicazione.id]);
+            }
+        }
+        await client.query('COMMIT');
+        programmaEmail(avviso.notifiche);
+        const apertura = (await pool.query(`SELECT ${COLONNE_APERTURA} FROM aperture_straordinarie a JOIN sedi s ON s.id = a.sede_id WHERE a.id = $1`, [id])).rows[0];
+        res.json({
+            success: true,
+            apertura,
+            destinatari: avviso.destinatari,
+            messaggio: `${fmtData(data)} sbloccato a ${sede.nome} dalle ${ora_inizio} alle ${ora_fine}.`
+                + (req.body.notifica_clienti ? ` Avviso inviato a ${esitoInvio(avviso.destinatari)}.` : ''),
+        });
+    } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        if (err.code === '23505') return res.status(409).json({ error: "Questa data è già sbloccata per questa sede" });
+        console.error("Errore apertura straordinaria:", err.message);
+        res.status(500).json({ error: "Errore nel salvataggio dell'apertura straordinaria" });
+    } finally {
+        client.release();
+    }
+});
+
+// Annulla un'apertura straordinaria: gli appuntamenti già presi quel giorno in quella sede vengono
+// cancellati e i clienti avvisati (in app e via email), come per le assenze.
+app.delete('/api/admin/aperture-straordinarie/:id', verificaToken, soloTitolare, async (req, res) => {
+    if (!/^\d+$/.test(req.params.id)) return res.status(404).json({ error: "Non trovata" });
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const r = await client.query('SELECT id, data::text AS data, sede_id FROM aperture_straordinarie WHERE id = $1 FOR UPDATE', [req.params.id]);
+        if (r.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: "Non trovata" });
+        }
+        const a = r.rows[0];
+        const app_ = await client.query(
+            `SELECT p.id, p.cliente_uuid, p.data, p.ora, b.nome AS barbiere_nome, sv.nome AS servizio_nome
+             FROM prenotazioni p
+             JOIN barbieri b ON b.id = p.barbiere_id
+             JOIN servizi sv ON sv.id = p.servizio_id
+             WHERE p.data = $1::date AND p.sede_id = $2 AND p.stato = 'attivo'`,
+            [a.data, a.sede_id]
+        );
+        const notifiche = [];
+        for (const p of app_.rows) {
+            await client.query("UPDATE prenotazioni SET stato = 'cancellato' WHERE id = $1", [p.id]);
+            if (p.cliente_uuid) {
+                const messaggio = `Ci scusiamo per il disagio. Il tuo appuntamento di **${fmtData(p.data)}** alle **${String(p.ora).slice(0, 5)}** con **${p.barbiere_nome}** per il servizio di **${p.servizio_nome}** è stato cancellato perché l'apertura straordinaria di quel giorno è stata annullata.\n\nTi invitiamo a prenotare un nuovo appuntamento.`;
+                notifiche.push(await creaNotifica(client, { cliente_uuid: p.cliente_uuid, tipo: 'cancellazione', titolo: 'Appuntamento cancellato', messaggio }));
+            }
+        }
+        await client.query('DELETE FROM aperture_straordinarie WHERE id = $1', [a.id]);
+        await client.query('COMMIT');
+        programmaEmail(notifiche);
+        res.json({
+            success: true,
+            cancellati: app_.rows.length,
+            messaggio: `Apertura straordinaria di ${fmtData(a.data)} annullata.`
+                + (app_.rows.length > 0 ? ` ${app_.rows.length} appuntamenti cancellati e clienti avvisati.` : ''),
+        });
+    } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error("Errore annullamento apertura:", err.message);
+        res.status(500).json({ error: "Errore" });
+    } finally {
+        client.release();
     }
 });
