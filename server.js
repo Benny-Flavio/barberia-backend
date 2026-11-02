@@ -175,27 +175,30 @@ const utenteDaToken = async (token) => {
     return utente;
 };
 
+// Ruoli (dal più alto): developer > super_admin (titolare) > admin (barbiere) > cliente
+const RUOLI_STAFF = ['admin', 'super_admin', 'developer'];
+
 const soloAdmin = (req, res, next) => {
-    if (req.utente.ruolo !== 'admin' && req.utente.ruolo !== 'super_admin') {
+    if (!RUOLI_STAFF.includes(req.utente.ruolo)) {
         return res.status(403).json({ error: "Accesso riservato ai barbieri" });
     }
     next();
 };
 
-// Funzioni riservate al titolare (super_admin): comunicazioni ai clienti e aperture straordinarie.
-// I barbieri (admin) ricevono 403 anche chiamando l'API direttamente.
-const soloTitolare = (req, res, next) => {
-    if (req.utente.ruolo !== 'super_admin') {
-        return res.status(403).json({ error: "Funzione riservata al titolare" });
+// Funzioni riservate al developer: comunicazioni a tutti i clienti e aperture straordinarie.
+// Titolare e barbieri ricevono 403 anche chiamando l'API direttamente.
+const soloDeveloper = (req, res, next) => {
+    if (req.utente.ruolo !== 'developer') {
+        return res.status(403).json({ error: "Funzione riservata allo sviluppatore" });
     }
     next();
 };
 
 // Staff di fiducia: ogni admin gestisce le prenotazioni di tutti i barbieri.
 // Assenze e permessi (che cancellano appuntamenti e notificano i clienti) restano
-// limitati al proprio barbiere; solo il titolare (super_admin) li gestisce per tutti.
+// limitati al proprio barbiere; il titolare (super_admin) e il developer li gestiscono per tutti.
 const puoGestireAssenze = (utente, barbiereId) =>
-    utente.ruolo === 'super_admin' ||
+    utente.ruolo === 'super_admin' || utente.ruolo === 'developer' ||
     (utente.barbiere_id != null && Number(barbiereId) === utente.barbiere_id);
 
 const vietato = (res) => res.status(403).json({ error: "Puoi gestire solo le tue assenze e i tuoi permessi" });
@@ -1198,7 +1201,7 @@ app.post('/api/admin/barbiere-presente', verificaToken, soloAdmin, async (req, r
 });
 
 // ==========================================
-// COMUNICAZIONI GENERALI (solo titolare, es. "Sede chiusa per problemi tecnici")
+// COMUNICAZIONI GENERALI (solo developer, es. "Sede chiusa per problemi tecnici")
 // ==========================================
 // Il messaggio arriva nella sezione Messaggi di ogni destinatario (una riga di notifiche ciascuno,
 // con il proprio stato "letto") e, se configurata, via email. Destinatari:
@@ -1236,7 +1239,7 @@ const esitoInvio = (n) => `${n} ${n === 1 ? 'cliente' : 'clienti'}`
     + (emailConfigurata() ? ' (in app e via email)' : ' (solo in app: email non configurata)');
 
 // Con anteprima: true non invia nulla e restituisce solo il numero di destinatari
-app.post('/api/admin/comunicazioni', verificaToken, soloTitolare, async (req, res) => {
+app.post('/api/admin/comunicazioni', verificaToken, soloDeveloper, async (req, res) => {
     const titolo = String(req.body.titolo ?? '').trim();
     const messaggio = String(req.body.messaggio ?? '').trim();
     const sedeId = req.body.sede_id == null || req.body.sede_id === '' ? null : Number(req.body.sede_id);
@@ -1282,7 +1285,7 @@ app.post('/api/admin/comunicazioni', verificaToken, soloTitolare, async (req, re
 });
 
 // Storico delle comunicazioni inviate, con l'esito delle email
-app.get('/api/admin/comunicazioni', verificaToken, soloTitolare, async (req, res) => {
+app.get('/api/admin/comunicazioni', verificaToken, soloDeveloper, async (req, res) => {
     try {
         const r = await pool.query(
             `SELECT c.id, c.titolo, c.messaggio, c.sede_id, c.destinatari, c.created_at,
@@ -1298,7 +1301,7 @@ app.get('/api/admin/comunicazioni', verificaToken, soloTitolare, async (req, res
 });
 
 // ==========================================
-// APERTURE STRAORDINARIE (solo titolare)
+// APERTURE STRAORDINARIE (solo developer)
 // ==========================================
 // Elenco pubblico delle aperture da oggi in poi: serve al calendario dei clienti per rendere
 // cliccabili solo quelle date (le altre domeniche e gli altri lunedì restano chiusi).
@@ -1320,7 +1323,7 @@ app.get('/api/aperture-straordinarie', async (req, res) => {
 
 // Sblocca UNA data di chiusura per una sede. Con notifica_clienti: true avvisa tutti i clienti
 // (in app e via email) contestualmente allo sblocco.
-app.post('/api/admin/aperture-straordinarie', verificaToken, soloTitolare, async (req, res) => {
+app.post('/api/admin/aperture-straordinarie', verificaToken, soloDeveloper, async (req, res) => {
     const { data, ora_inizio, ora_fine } = req.body;
     const sedeId = Number(req.body.sede_id);
     const barbieri = Array.isArray(req.body.barbieri) ? [...new Set(req.body.barbieri.map(Number))] : [];
@@ -1380,7 +1383,7 @@ app.post('/api/admin/aperture-straordinarie', verificaToken, soloTitolare, async
 
 // Annulla un'apertura straordinaria: gli appuntamenti già presi quel giorno in quella sede vengono
 // cancellati e i clienti avvisati (in app e via email), come per le assenze.
-app.delete('/api/admin/aperture-straordinarie/:id', verificaToken, soloTitolare, async (req, res) => {
+app.delete('/api/admin/aperture-straordinarie/:id', verificaToken, soloDeveloper, async (req, res) => {
     if (!/^\d+$/.test(req.params.id)) return res.status(404).json({ error: "Non trovata" });
     const client = await pool.connect();
     try {
