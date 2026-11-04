@@ -26,6 +26,8 @@ app.use('/api/prenotazioni', limiteScritture);
 app.use('/api/auth', limiteScritture);
 app.use('/api/admin/comunicazioni', limiteScritture);
 app.use('/api/admin/aperture-straordinarie', limiteScritture);
+app.use('/api/admin/orari-sedi', limiteScritture);
+app.use('/api/admin/turni', limiteScritture);
 
 // ==========================================
 // CONFIGURAZIONE DATABASE
@@ -255,8 +257,9 @@ const fmtData = (d) => {
 // ==========================================
 // GIORNI DI CHIUSURA E APERTURE STRAORDINARIE
 // ==========================================
-// Domenica e lunedì il negozio è chiuso, tranne le singole date sbloccate dal titolare
-// (tabella aperture_straordinarie: una riga = una data precisa per una sede, mai ricorrente).
+// Orari standard per sede e giorno della settimana nella tabella orari_sedi (modificabili dalla
+// Console Developer): un giorno senza fasce è un giorno di chiusura. Le singole date di chiusura
+// possono essere sbloccate (tabella aperture_straordinarie: una riga = una data precisa, mai ricorrente).
 const DATA_RE = /^\d{4}-\d{2}-\d{2}$/;
 const ORA_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
 // Giorno della settimana (0=dom … 6=sab) di una data 'YYYY-MM-DD', indipendente dal fuso del server
@@ -264,7 +267,16 @@ const giornoDellaSettimana = (data) => {
     const [y, m, g] = dataStr(data).split('-').map(Number);
     return new Date(Date.UTC(y, m - 1, g)).getUTCDay();
 };
-const giornoDiChiusura = (data) => [0, 1].includes(giornoDellaSettimana(data));
+
+// Fasce di apertura standard [inizio, fine] in minuti di una sede in un giorno della settimana ([] = chiusa)
+const fasceSede = async (db, sedeId, giorno) => {
+    const r = await db.query(
+        `SELECT to_char(ora_inizio, 'HH24:MI') AS i, to_char(ora_fine, 'HH24:MI') AS f
+         FROM orari_sedi WHERE sede_id = $1 AND giorno_settimana = $2 ORDER BY ora_inizio`,
+        [sedeId, giorno]
+    );
+    return r.rows.map((x) => [minuti(x.i), minuti(x.f)]);
+};
 
 const COLONNE_APERTURA = `a.id, a.data::text AS data, a.sede_id, s.nome AS sede_nome,
     to_char(a.ora_inizio, 'HH24:MI') AS ora_inizio, to_char(a.ora_fine, 'HH24:MI') AS ora_fine, a.barbieri`;
@@ -280,6 +292,30 @@ const aperturaStraordinaria = async (db, data, { sedeId = null, barbiereId = nul
     );
     return r.rows[0] || null;
 };
+
+// Fasce prenotabili di un barbiere in una data: quelle dell'apertura straordinaria se quel giorno è
+// in servizio, altrimenti l'orario standard della sede del suo turno settimanale. [] = non prenotabile.
+// Con sedeId limita la ricerca a quella sede.
+const fasceBarbiere = async (db, barbiereId, data, sedeId = null) => {
+    const apertura = await aperturaStraordinaria(db, data, { sedeId, barbiereId });
+    if (apertura) return [[minuti(apertura.ora_inizio), minuti(apertura.ora_fine)]];
+    const giorno = giornoDellaSettimana(data);
+    const t = await db.query(
+        `SELECT sede_id FROM turni_rotazione
+         WHERE barbiere_id = $1 AND giorno_settimana = $2 AND ($3::int IS NULL OR sede_id = $3::int)`,
+        [barbiereId, giorno, sedeId]
+    );
+    if (t.rows.length === 0) return [];
+    return fasceSede(db, t.rows[0].sede_id, giorno);
+};
+
+// Archivio operazioni del developer (Console Developer → Archivio Operazioni / Esporta Report).
+// Va chiamata dentro la stessa transazione dell'operazione: si registra solo ciò che è stato salvato.
+const registraOperazione = (db, utente, azione, descrizione, dettagli = null) =>
+    db.query(
+        'INSERT INTO developer_logs (utente_id, azione, descrizione, dettagli) VALUES ($1, $2, $3, $4)',
+        [utente.uuid, azione, descrizione, dettagli ? JSON.stringify(dettagli) : null]
+    );
 
 const COLONNE_ASSENZA = `id, barbiere_id, tipo, data_inizio::text AS data_inizio, data_fine::text AS data_fine,
     to_char(ora_inizio, 'HH24:MI') AS ora_inizio, to_char(ora_fine, 'HH24:MI') AS ora_fine, motivo`;
@@ -641,17 +677,21 @@ app.get('/api/barbieri-disponibili', async (req, res) => {
 
     try {
         let result;
-        if (giornoDiChiusura(data)) {
-            // Domenica/lunedì: prenotabile solo se QUESTA data è un'apertura straordinaria della sede
-            const apertura = await aperturaStraordinaria(pool, data, { sedeId: Number(sede_id) });
-            if (!apertura) return res.json({ messaggio: "Il negozio è chiuso di Domenica e Lunedì", barbieri: [] });
+        const giorno = giornoDellaSettimana(data);
+        // Apertura straordinaria di QUESTA data: i barbieri scelti per quel giorno
+        const apertura = await aperturaStraordinaria(pool, data, { sedeId: Number(sede_id) });
+        if (apertura) {
             result = await pool.query('SELECT id, nome FROM barbieri WHERE id = ANY($1::int[]) ORDER BY id', [apertura.barbieri]);
         } else {
+            // Giorno di chiusura della sede secondo l'orario standard
+            if ((await fasceSede(pool, Number(sede_id), giorno)).length === 0) {
+                return res.json({ messaggio: "La sede è chiusa in questa data", barbieri: [] });
+            }
             result = await pool.query(
                 `SELECT b.id, b.nome FROM barbieri b
                  JOIN turni_rotazione t ON b.id = t.barbiere_id
                  WHERE t.sede_id = $1 AND t.giorno_settimana = $2`,
-                [sede_id, giornoDellaSettimana(data)]
+                [sede_id, giorno]
             );
         }
         // Disabilitato = assente per l'intera giornata richiesta. I permessi bloccano solo
@@ -676,17 +716,9 @@ app.get('/api/orari-disponibili', async (req, res) => {
     if (!DATA_RE.test(data)) return res.status(400).json({ error: "Data non valida" });
 
     try {
-        let fasce;
-        if (giornoDiChiusura(data)) {
-            // Domenica/lunedì: solo la fascia dell'apertura straordinaria di questa data, se il barbiere è in servizio
-            const apertura = await aperturaStraordinaria(pool, data, { barbiereId: Number(barbiere_id) });
-            if (!apertura) return res.json([]);
-            fasce = [[minuti(apertura.ora_inizio), minuti(apertura.ora_fine)]];
-        } else {
-            fasce = giornoDellaSettimana(data) === 4
-                ? [[720, 1320]]
-                : [[540, 720], [900, 1140]];
-        }
+        // Orario standard della sede del suo turno, o la fascia dell'apertura straordinaria
+        const fasce = await fasceBarbiere(pool, Number(barbiere_id), data);
+        if (fasce.length === 0) return res.json([]);
 
         let durataServizio = 40;
         if (servizio_id) {
@@ -794,14 +826,15 @@ app.post('/api/prenotazioni', verificaToken, async (req, res) => {
             await client.query('ROLLBACK');
             return res.status(409).json({ error: "Questo orario è già prenotato!" });
         }
-        // Domenica/lunedì: solo dentro un'apertura straordinaria di QUESTA data, sede e barbiere
-        if (giornoDiChiusura(data)) {
-            const apertura = await aperturaStraordinaria(client, data, { sedeId: Number(sede_id), barbiereId: Number(barbiere_id) });
+        // L'appuntamento deve stare tutto in una fascia prenotabile: orario standard della sede in cui il
+        // barbiere è di turno quel giorno, oppure l'apertura straordinaria di QUESTA data
+        {
+            const fasce = await fasceBarbiere(client, Number(barbiere_id), data, Number(sede_id));
             const durata = (await client.query('SELECT durata_minuti FROM servizi WHERE id = $1', [servizio_id])).rows[0]?.durata_minuti || 40;
             const inizio = minuti(ora);
-            if (!apertura || inizio < minuti(apertura.ora_inizio) || inizio + durata > minuti(apertura.ora_fine)) {
+            if (!fasce.some(([a, z]) => inizio >= a && inizio + durata <= z)) {
                 await client.query('ROLLBACK');
-                return res.status(409).json({ error: "Il negozio è chiuso in questa data o in questo orario" });
+                return res.status(409).json({ error: "La sede è chiusa o il barbiere non è in servizio in questo orario" });
             }
         }
         if (!(await slotDisponibile(client, barbiere_id, data, ora, servizio_id))) {
@@ -1288,6 +1321,11 @@ app.post('/api/admin/comunicazioni', verificaToken, soloDeveloper, async (req, r
             await client.query('ROLLBACK');
             return res.status(400).json({ error: "Nessun cliente destinatario" });
         }
+        const aChi = clienteUuid ? '1 cliente' : sedeId
+            ? `${esito.destinatari} clienti di ${(await client.query('SELECT nome FROM sedi WHERE id = $1', [sedeId])).rows[0].nome}`
+            : `${esito.destinatari} clienti (tutti)`;
+        await registraOperazione(client, req.utente, 'comunicazione', `Inviata comunicazione «${titolo}» a ${aChi}`,
+            { comunicazione_id: esito.comunicazione.id, sede_id: sedeId, destinatari: esito.destinatari });
         await client.query('COMMIT');
         programmaEmail(esito.notifiche);
         res.json({
@@ -1351,7 +1389,6 @@ app.post('/api/admin/aperture-straordinarie', verificaToken, soloDeveloper, asyn
     const barbieri = Array.isArray(req.body.barbieri) ? [...new Set(req.body.barbieri.map(Number))] : [];
     const oggi = oraItalia().data;
     if (!DATA_RE.test(data || '')) return res.status(400).json({ error: "Data non valida" });
-    if (!giornoDiChiusura(data)) return res.status(400).json({ error: "Le aperture straordinarie riguardano solo i giorni di chiusura (domenica e lunedì)" });
     if (data < oggi) return res.status(400).json({ error: "La data è già passata" });
     if (!ORA_RE.test(ora_inizio || '') || !ORA_RE.test(ora_fine || '')) return res.status(400).json({ error: "Orario non valido" });
     if (minuti(ora_fine) - minuti(ora_inizio) < 40) return res.status(400).json({ error: "L'apertura deve durare almeno 40 minuti" });
@@ -1362,6 +1399,10 @@ app.post('/api/admin/aperture-straordinarie', verificaToken, soloDeveloper, asyn
     try {
         const sede = (await client.query('SELECT nome FROM sedi WHERE id = $1', [sedeId])).rows[0];
         if (!sede) return res.status(400).json({ error: "Sede non valida" });
+        // Solo un giorno di chiusura di QUESTA sede secondo l'orario standard
+        if ((await fasceSede(client, sedeId, giornoDellaSettimana(data))).length > 0) {
+            return res.status(400).json({ error: `In questo giorno ${sede.nome} è già aperta: l'apertura straordinaria serve solo per i giorni di chiusura` });
+        }
         const esistenti = await client.query('SELECT count(*)::int AS n FROM barbieri WHERE id = ANY($1::int[])', [barbieri]);
         if (esistenti.rows[0].n !== barbieri.length) return res.status(400).json({ error: "Barbiere non valido" });
 
@@ -1383,6 +1424,10 @@ app.post('/api/admin/aperture-straordinarie', verificaToken, soloDeveloper, asyn
                 await client.query('UPDATE aperture_straordinarie SET comunicazione_id = $2 WHERE id = $1', [id, avviso.comunicazione.id]);
             }
         }
+        await registraOperazione(client, req.utente, 'apertura_straordinaria',
+            `Sbloccata data ${fmtData(data)} ${data.slice(0, 4)} a ${sede.nome}, ${ora_inizio}–${ora_fine}`
+            + (req.body.notifica_clienti ? ` (avviso a ${avviso.destinatari} clienti)` : ''),
+            { apertura_id: id, data, sede_id: sedeId, ora_inizio, ora_fine, barbieri, destinatari: avviso.destinatari });
         await client.query('COMMIT');
         programmaEmail(avviso.notifiche);
         const apertura = (await pool.query(`SELECT ${COLONNE_APERTURA} FROM aperture_straordinarie a JOIN sedi s ON s.id = a.sede_id WHERE a.id = $1`, [id])).rows[0];
@@ -1410,7 +1455,11 @@ app.delete('/api/admin/aperture-straordinarie/:id', verificaToken, soloDeveloper
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
-        const r = await client.query('SELECT id, data::text AS data, sede_id FROM aperture_straordinarie WHERE id = $1 FOR UPDATE', [req.params.id]);
+        const r = await client.query(
+            `SELECT a.id, a.data::text AS data, a.sede_id, s.nome AS sede_nome
+             FROM aperture_straordinarie a JOIN sedi s ON s.id = a.sede_id WHERE a.id = $1 FOR UPDATE OF a`,
+            [req.params.id]
+        );
         if (r.rows.length === 0) {
             await client.query('ROLLBACK');
             return res.status(404).json({ error: "Non trovata" });
@@ -1433,6 +1482,10 @@ app.delete('/api/admin/aperture-straordinarie/:id', verificaToken, soloDeveloper
             }
         }
         await client.query('DELETE FROM aperture_straordinarie WHERE id = $1', [a.id]);
+        await registraOperazione(client, req.utente, 'apertura_annullata',
+            `Annullata apertura straordinaria di ${fmtData(a.data)} ${a.data.slice(0, 4)} a ${a.sede_nome}`
+            + (app_.rows.length > 0 ? ` (${app_.rows.length} appuntamenti cancellati)` : ''),
+            { data: a.data, sede_id: a.sede_id, appuntamenti_cancellati: app_.rows.length });
         await client.query('COMMIT');
         programmaEmail(notifiche);
         res.json({
@@ -1447,5 +1500,225 @@ app.delete('/api/admin/aperture-straordinarie/:id', verificaToken, soloDeveloper
         res.status(500).json({ error: "Errore" });
     } finally {
         client.release();
+    }
+});
+
+// ==========================================
+// CONSOLE DEVELOPER: ORARI SEDI, TURNI BARBIERI, ARCHIVIO OPERAZIONI
+// ==========================================
+const GIORNI_BREVI = ['Dom', 'Lun', 'Mar', 'Mer', 'Gio', 'Ven', 'Sab'];
+const ORDINE_SETTIMANA = [1, 2, 3, 4, 5, 6, 0]; // da lunedì a domenica, per le descrizioni
+
+// Orario settimanale di una o tutte le sedi: [{ sede_id, giorno_settimana, fasce: [{ inizio, fine }] }]
+// per tutti i 7 giorni (fasce vuote = chiuso). Pubblico: serve al calendario cliente e a "Le nostre sedi".
+const orariSettimanali = async (db, sedeId = null) => {
+    const sedi = (await db.query('SELECT id FROM sedi WHERE ($1::int IS NULL OR id = $1::int) ORDER BY id', [sedeId])).rows;
+    const r = await db.query(
+        `SELECT sede_id, giorno_settimana, to_char(ora_inizio, 'HH24:MI') AS inizio, to_char(ora_fine, 'HH24:MI') AS fine
+         FROM orari_sedi WHERE ($1::int IS NULL OR sede_id = $1::int) ORDER BY sede_id, giorno_settimana, ora_inizio`,
+        [sedeId]
+    );
+    return sedi.flatMap((s) => [0, 1, 2, 3, 4, 5, 6].map((g) => ({
+        sede_id: s.id,
+        giorno_settimana: g,
+        fasce: r.rows.filter((x) => x.sede_id === s.id && x.giorno_settimana === g).map(({ inizio, fine }) => ({ inizio, fine })),
+    })));
+};
+
+app.get('/api/orari-sedi', async (req, res) => {
+    const sedeId = req.query.sede_id ? Number(req.query.sede_id) : null;
+    if (sedeId !== null && !Number.isInteger(sedeId)) return res.status(400).json({ error: "Sede non valida" });
+    try {
+        res.json(await orariSettimanali(pool, sedeId));
+    } catch (err) {
+        res.status(500).json({ error: "Errore" });
+    }
+});
+
+// Sostituisce l'orario settimanale di una sede. Body: { giorni: { "0": [], "2": [{ inizio, fine }, …], … } }
+// (un giorno assente o con [] = chiuso). Gli appuntamenti già presi non vengono toccati: la risposta
+// segnala quanti, da oggi in poi, cadono fuori dal nuovo orario.
+app.put('/api/admin/orari-sedi/:sede_id', verificaToken, soloDeveloper, async (req, res) => {
+    const sedeId = Number(req.params.sede_id);
+    const giorni = req.body?.giorni;
+    if (!Number.isInteger(sedeId)) return res.status(400).json({ error: "Sede non valida" });
+    if (!giorni || typeof giorni !== 'object') return res.status(400).json({ error: "Orario mancante" });
+    const nuovo = {};
+    for (let g = 0; g <= 6; g++) {
+        const fasce = Array.isArray(giorni[g]) ? giorni[g] : [];
+        if (fasce.length > 3) return res.status(400).json({ error: `${GIORNI[g]}: al massimo 3 fasce` });
+        const ordinate = [...fasce].sort((a, b) => String(a?.inizio).localeCompare(String(b?.inizio)));
+        for (let i = 0; i < ordinate.length; i++) {
+            const { inizio, fine } = ordinate[i] || {};
+            if (!ORA_RE.test(inizio || '') || !ORA_RE.test(fine || '')) return res.status(400).json({ error: `${GIORNI[g]}: orario non valido` });
+            if (minuti(fine) - minuti(inizio) < 20) return res.status(400).json({ error: `${GIORNI[g]}: ogni fascia deve durare almeno 20 minuti` });
+            if (i > 0 && minuti(inizio) < minuti(ordinate[i - 1].fine)) return res.status(400).json({ error: `${GIORNI[g]}: le fasce si sovrappongono` });
+        }
+        nuovo[g] = ordinate.map(({ inizio, fine }) => ({ inizio, fine }));
+    }
+    const client = await pool.connect();
+    try {
+        const sede = (await client.query('SELECT nome FROM sedi WHERE id = $1', [sedeId])).rows[0];
+        if (!sede) return res.status(400).json({ error: "Sede non valida" });
+        await client.query('BEGIN');
+        await client.query('DELETE FROM orari_sedi WHERE sede_id = $1', [sedeId]);
+        for (let g = 0; g <= 6; g++) {
+            for (const f of nuovo[g]) {
+                await client.query('INSERT INTO orari_sedi (sede_id, giorno_settimana, ora_inizio, ora_fine) VALUES ($1, $2, $3, $4)', [sedeId, g, f.inizio, f.fine]);
+            }
+        }
+        // Appuntamenti futuri della sede che non stanno più in una fascia (esclusi i giorni di apertura straordinaria)
+        const futuri = await client.query(
+            `SELECT p.data::text AS data, to_char(p.ora, 'HH24:MI') AS ora, COALESCE(sv.durata_minuti, 40) AS durata
+             FROM prenotazioni p LEFT JOIN servizi sv ON sv.id = p.servizio_id
+             WHERE p.sede_id = $1 AND p.stato = 'attivo' AND p.data >= $2::date
+               AND NOT EXISTS (SELECT 1 FROM aperture_straordinarie a WHERE a.data = p.data AND a.sede_id = p.sede_id)`,
+            [sedeId, oraItalia().data]
+        );
+        const fuoriOrario = futuri.rows.filter((p) => !nuovo[giornoDellaSettimana(p.data)].some((f) =>
+            minuti(p.ora) >= minuti(f.inizio) && minuti(p.ora) + p.durata <= minuti(f.fine))).length;
+        const riepilogo = ORDINE_SETTIMANA.map((g) => `${GIORNI_BREVI[g]} ${nuovo[g].length ? nuovo[g].map((f) => `${f.inizio}–${f.fine}`).join(', ') : 'chiuso'}`).join(' · ');
+        await registraOperazione(client, req.utente, 'orari_sede', `Modificato orario ${sede.nome}: ${riepilogo}`, { sede_id: sedeId, giorni: nuovo });
+        await client.query('COMMIT');
+        res.json({
+            success: true,
+            orari: await orariSettimanali(pool, sedeId),
+            fuori_orario: fuoriOrario,
+            messaggio: `Orario di ${sede.nome} aggiornato.`
+                + (fuoriOrario > 0 ? ` Attenzione: ${fuoriOrario} appuntamenti già presi cadono fuori dal nuovo orario (restano validi).` : ''),
+        });
+    } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error("Errore orari sede:", err.message);
+        res.status(500).json({ error: "Errore nel salvataggio dell'orario" });
+    } finally {
+        client.release();
+    }
+});
+
+// Turni fissi di tutti i barbieri: [{ id, nome, turni: { "2": sede_id, … } }] (giorno assente = riposo)
+const turniBarbieri = async (db) => {
+    const b = await db.query('SELECT id, nome FROM barbieri ORDER BY id');
+    const t = await db.query('SELECT barbiere_id, giorno_settimana, sede_id FROM turni_rotazione');
+    return b.rows.map((x) => ({
+        ...x,
+        turni: Object.fromEntries(t.rows.filter((r) => r.barbiere_id === x.id).map((r) => [r.giorno_settimana, r.sede_id])),
+    }));
+};
+
+app.get('/api/admin/turni', verificaToken, soloDeveloper, async (req, res) => {
+    try {
+        res.json(await turniBarbieri(pool));
+    } catch (err) {
+        res.status(500).json({ error: "Errore" });
+    }
+});
+
+// Sostituisce i turni fissi di un barbiere. Body: { turni: { "2": 1, "3": 2, … } } (una sede per giorno).
+// Gli appuntamenti già presi non vengono toccati: la risposta segnala quanti cadono in giorni non più di turno.
+app.put('/api/admin/turni/:barbiere_id', verificaToken, soloDeveloper, async (req, res) => {
+    const barbiereId = Number(req.params.barbiere_id);
+    const turni = req.body?.turni;
+    if (!Number.isInteger(barbiereId)) return res.status(400).json({ error: "Barbiere non valido" });
+    if (!turni || typeof turni !== 'object') return res.status(400).json({ error: "Turni mancanti" });
+    const nuovi = [];
+    for (const [g, s] of Object.entries(turni)) {
+        if (s == null || s === '') continue;
+        if (!/^[0-6]$/.test(g) || !Number.isInteger(Number(s))) return res.status(400).json({ error: "Turno non valido" });
+        nuovi.push([Number(g), Number(s)]);
+    }
+    const client = await pool.connect();
+    try {
+        const barbiere = (await client.query('SELECT nome FROM barbieri WHERE id = $1', [barbiereId])).rows[0];
+        if (!barbiere) return res.status(404).json({ error: "Barbiere non trovato" });
+        const sedi = new Map((await client.query('SELECT id, nome FROM sedi')).rows.map((s) => [s.id, s.nome]));
+        if (nuovi.some(([, s]) => !sedi.has(s))) return res.status(400).json({ error: "Sede non valida" });
+        await client.query('BEGIN');
+        await client.query('DELETE FROM turni_rotazione WHERE barbiere_id = $1', [barbiereId]);
+        for (const [g, s] of nuovi) {
+            await client.query('INSERT INTO turni_rotazione (barbiere_id, sede_id, giorno_settimana) VALUES ($1, $2, $3)', [barbiereId, s, g]);
+        }
+        // fisso = una sola sede, rotante = più sedi nella settimana
+        await client.query('UPDATE barbieri SET tipo = $2 WHERE id = $1', [barbiereId, new Set(nuovi.map(([, s]) => s)).size > 1 ? 'rotante' : 'fisso']);
+        // Appuntamenti futuri del barbiere in un giorno/sede non più di turno (esclusi quelli in aperture straordinarie)
+        const futuri = await client.query(
+            `SELECT p.data::text AS data, p.sede_id FROM prenotazioni p
+             WHERE p.barbiere_id = $1 AND p.stato = 'attivo' AND p.data >= $2::date
+               AND NOT EXISTS (SELECT 1 FROM aperture_straordinarie a WHERE a.data = p.data AND a.sede_id = p.sede_id AND $1 = ANY(a.barbieri))`,
+            [barbiereId, oraItalia().data]
+        );
+        const mappa = new Map(nuovi);
+        const fuoriTurno = futuri.rows.filter((p) => mappa.get(giornoDellaSettimana(p.data)) !== p.sede_id).length;
+        const riepilogo = ORDINE_SETTIMANA.filter((g) => mappa.has(g)).map((g) => `${GIORNI_BREVI[g]} ${sedi.get(mappa.get(g))}`).join(', ') || 'nessun giorno di turno';
+        await registraOperazione(client, req.utente, 'turni_barbiere', `Modificati turni di ${barbiere.nome}: ${riepilogo}`, { barbiere_id: barbiereId, turni: Object.fromEntries(nuovi) });
+        await client.query('COMMIT');
+        res.json({
+            success: true,
+            fuori_turno: fuoriTurno,
+            messaggio: `Turni di ${barbiere.nome} aggiornati.`
+                + (fuoriTurno > 0 ? ` Attenzione: ${fuoriTurno} appuntamenti già presi cadono in giorni non più di turno (restano validi).` : ''),
+        });
+    } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        console.error("Errore turni:", err.message);
+        res.status(500).json({ error: "Errore nel salvataggio dei turni" });
+    } finally {
+        client.release();
+    }
+});
+
+// Archivio operazioni filtrato per mese/anno (ora italiana)
+const ETICHETTA_AZIONE = {
+    comunicazione: 'Comunicazione inviata',
+    apertura_straordinaria: 'Apertura straordinaria',
+    apertura_annullata: 'Apertura annullata',
+    orari_sede: 'Orario sede modificato',
+    turni_barbiere: 'Turni barbiere modificati',
+};
+const leggiOperazioni = async (anno, mese) => {
+    const r = await pool.query(
+        `SELECT id, azione, descrizione,
+                to_char(created_at AT TIME ZONE 'Europe/Rome', 'YYYY-MM-DD') AS data,
+                to_char(created_at AT TIME ZONE 'Europe/Rome', 'HH24:MI') AS ora
+         FROM developer_logs
+         WHERE (created_at AT TIME ZONE 'Europe/Rome') >= make_date($1, $2, 1)
+           AND (created_at AT TIME ZONE 'Europe/Rome') < make_date($1, $2, 1) + interval '1 month'
+         ORDER BY created_at DESC`,
+        [anno, mese]
+    );
+    return r.rows.map((x) => ({ ...x, azione_etichetta: ETICHETTA_AZIONE[x.azione] || x.azione }));
+};
+const meseValido = (q) => {
+    const anno = Number(q.anno), mese = Number(q.mese);
+    return Number.isInteger(anno) && anno >= 2020 && anno <= 2100 && Number.isInteger(mese) && mese >= 1 && mese <= 12 ? { anno, mese } : null;
+};
+
+app.get('/api/admin/developer-logs', verificaToken, soloDeveloper, async (req, res) => {
+    const p = meseValido(req.query);
+    if (!p) return res.status(400).json({ error: "Mese o anno non validi" });
+    try {
+        res.json(await leggiOperazioni(p.anno, p.mese));
+    } catch (err) {
+        res.status(500).json({ error: "Errore" });
+    }
+});
+
+// Report CSV del mese (separatore ";" e BOM UTF-8: si apre direttamente in Excel con accenti corretti)
+app.get('/api/admin/developer-logs/export', verificaToken, soloDeveloper, async (req, res) => {
+    const p = meseValido(req.query);
+    if (!p) return res.status(400).json({ error: "Mese o anno non validi" });
+    try {
+        const righe = (await leggiOperazioni(p.anno, p.mese)).reverse(); // in ordine cronologico
+        const cella = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+        const csv = [
+            ['Data', 'Ora', 'Tipo di azione', 'Descrizione'].map(cella).join(';'),
+            ...righe.map((x) => [x.data.split('-').reverse().join('/'), x.ora, x.azione_etichetta, x.descrizione].map(cella).join(';')),
+        ].join('\r\n');
+        const nome = `report-operazioni-${p.anno}-${String(p.mese).padStart(2, '0')}.csv`;
+        res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+        res.setHeader('Content-Disposition', `attachment; filename="${nome}"`);
+        res.send('﻿' + csv + '\r\n');
+    } catch (err) {
+        res.status(500).json({ error: "Errore" });
     }
 });
