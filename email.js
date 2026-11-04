@@ -41,8 +41,13 @@ const templateHtml = (titolo, messaggio) => `<!doctype html>
   </table>
 </body></html>`;
 
-// Invia una email; lancia un errore se Resend la rifiuta o non risponde entro 10 s
+// Invia una email; lancia un errore se Resend la rifiuta o non risponde entro 10 s.
+// Senza configurazione non fa nulla (restituisce false): il modulo non lancia mai all'avvio.
 const inviaEmail = async ({ a, oggetto, titolo, messaggio }) => {
+    if (!emailConfigurata()) {
+        console.warn('Email non inviata: RESEND_API_KEY / EMAIL_MITTENTE non impostate');
+        return false;
+    }
     const res = await fetch(RESEND_URL, {
         method: 'POST',
         headers: { Authorization: `Bearer ${process.env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },

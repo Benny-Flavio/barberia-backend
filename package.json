@@ -2,8 +2,9 @@
   "name": "barberia-backend",
   "version": "1.0.0",
   "description": "",
-  "main": "index.js",
+  "main": "server.js",
   "scripts": {
+    "start": "node server.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
@@ -17,5 +18,8 @@
     "express-rate-limit": "^7.5.0",
     "node-cron": "^4.2.1",
     "pg": "^8.20.0"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }

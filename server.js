@@ -32,11 +32,33 @@ app.use('/api/admin/aperture-straordinarie', limiteScritture);
 // ==========================================
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
-    ssl: { rejectUnauthorized: false }
+    ssl: { rejectUnauthorized: false },
+    // Se il database non risponde, la richiesta fallisce dopo 10 s invece di restare appesa
+    // (l'app mostrava un caricamento infinito)
+    connectionTimeoutMillis: 10000,
 });
 
-app.listen(process.env.PORT, () => {
-    console.log(`Server avviato sulla porta ${process.env.PORT}`);
+// Una connessione inattiva chiusa dal database (riavvio/manutenzione del pooler Supabase, rete)
+// fa emettere 'error' al pool: senza questo gestore Node termina il processo e Render entra in un
+// ciclo di crash (503 su tutte le rotte). Il pool scarta la connessione e alla prossima query ne apre una nuova.
+pool.on('error', (err) => {
+    console.warn('DB: connessione inattiva persa, il server resta attivo —', err.message);
+});
+
+// Ultima rete di sicurezza: un errore non gestito viene registrato nei log senza spegnere il server
+process.on('unhandledRejection', (err) => {
+    console.error('Promise rifiutata non gestita:', err?.message || err);
+});
+process.on('uncaughtException', (err) => {
+    console.error('Eccezione non gestita:', err?.stack || err);
+});
+
+const PORTA = process.env.PORT || 3000;
+app.listen(PORTA, () => {
+    console.log(`Server avviato sulla porta ${PORTA}`);
+    if (!emailConfigurata()) {
+        console.warn('Email disattivate: RESEND_API_KEY / EMAIL_MITTENTE non impostate. I messaggi restano solo in app.');
+    }
 });
 
 // Assicura che le colonne esistano (idempotente)
